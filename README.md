@@ -1,8 +1,8 @@
-# Congress.gov — Bills, Votes, Members
+# US Congress — Bills, Votes, Members (GovTrack)
 
-The Library of Congress's Congress.gov API. Bills (House and Senate), members of Congress, committees, votes, congressional records, treaties. The authoritative source for "what's happening on Capitol Hill" — bill status, who voted what, who sponsors what. Free, requires a free API key.
+US federal bills (House and Senate), members of Congress and roll-call votes, served from GovTrack's public API (`www.govtrack.us/api/v2`), which mirrors the Library of Congress record from the 93rd Congress (1973) onward. Bill status, who voted what, who sponsors what. Free, no API key.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1476+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1679+ live data sources.
 
 ## Why this matters for AI agents
 
@@ -17,7 +17,15 @@ Common flows:
 
 ## Auth
 
-Congress.gov requires a free API key from https://api.congress.gov/sign-up/. Pass via `_apiKey`. Generous rate limits.
+None. GovTrack's API is public and keyless; this pack sends no credential.
+
+## Search ranking (`search_bills`)
+
+GovTrack's `q` parameter is a loose keyword match with no relevance ordering — for "Lower Energy Costs Act" it reports ~4,300 matches and puts a 2014 salmon bill first, while H.R. 1 (118th), the bill literally so named, sits 86th inside its own Congress's matches and beyond the 1,000-row offset GovTrack allows. `order_by=relevance` is rejected. So `search_bills` gathers candidates itself and ranks them locally:
+
+- **Candidates.** One unfiltered page (100 rows) plus one page for each of the three most recent Congresses. If nothing yet contains the query phrase, it pages deeper into those Congresses (up to 300 rows each), then takes one page from each of the six Congresses before them. Pass `congress` to search a single Congress exhaustively (up to ~1,100 rows) — do this for a bill older than about six years.
+- **Ranking.** Every title a bill has ever carried (display, short, short-partial, official) is scored: exact title, then a title containing the phrase (shorter wins), then all query words present (prefix-tolerant, so "lower" matches "Lowering"), then partial overlap. Ties go to the newer Congress. Each returned bill carries `match` (`exact` / `phrase` / `all_words` / `partial` / `none`) and `matched_title`.
+- **`total`** is GovTrack's loose-match count, not the number of bills about the subject; `total_note` says so in the payload, and `ranking` states that upstream order was not used.
 
 ## Congress numbering
 
@@ -91,9 +99,45 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1476+ data sources. The
+Both URLs reach the same gateway and the same 1679+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
+
+## No MCP client? Call it over HTTP
+
+```bash
+curl -X POST https://gateway.pipeworx.io/v1/tools/congress_search_bills \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"Lower Energy Costs Act","limit":10}'
+```
+
+No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/congress_search_bills`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
+
+## Standalone (no gateway account)
+
+This package also runs as a local stdio MCP server — no Pipeworx account, no
+gateway round-trip:
+
+```json
+{
+  "mcpServers": {
+    "congress": {
+      "command": "npx",
+      "args": ["-y", "@pipeworx/mcp-congress"]
+    }
+  }
+}
+```
+
+Or run it directly to confirm it starts:
+
+```bash
+npx -y @pipeworx/mcp-congress
+```
+
+It speaks MCP over stdin/stdout and answers `initialize`/`tools/list`/`tools/call`
+for **only** this pack's tools — none of the shared meta-tools the gateway
+connection above adds. Same source, same tools, no ask_pipeworx routing.
 
 ## Using with ask_pipeworx
 
@@ -114,13 +158,3 @@ The gateway picks the right tool and fills the arguments automatically.
 ## License
 
 MIT
-
-## No MCP client? Call it over HTTP
-
-```bash
-curl -X POST https://gateway.pipeworx.io/v1/tools/congress_search_bills \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"Lower Energy Costs Act","limit":10}'
-```
-
-No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/congress_search_bills`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
