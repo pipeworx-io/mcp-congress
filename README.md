@@ -2,7 +2,7 @@
 
 US federal bills (House and Senate), members of Congress and roll-call votes, served from GovTrack's public API (`www.govtrack.us/api/v2`), which mirrors the Library of Congress record from the 93rd Congress (1973) onward. Bill status, who voted what, who sponsors what. Free, no API key.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1679+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
 
 ## Why this matters for AI agents
 
@@ -99,7 +99,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1679+ data sources. The
+Both URLs reach the same gateway and the same 1683+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

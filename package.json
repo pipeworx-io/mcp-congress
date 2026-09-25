@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-congress",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Congress MCP — US Congress data via GovTrack API (free, no auth required)",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-cc3b9d4b0434f308ba0e52a3906e8dc388d92a3baeedb56c917507dc6d03dc65",
-    "sourceCommit": "60f04b68c347e970c6be94a53439d1364061fc06"
+    "sourceHash": "v1-aa80fab12f1c5470ad5097592064581debd177b8964b1d677ad7dbb8ded010e1",
+    "sourceCommit": "5b29c2b0c11e1fcd954969a245b474e6e9475116"
   }
 }
