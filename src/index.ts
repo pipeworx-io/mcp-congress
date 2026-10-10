@@ -672,6 +672,7 @@ function collapse(s: string): string {
 }
 /**
  * Congress MCP — US Congress data via GovTrack API (free, no auth required)
+ * plus committee rosters/leadership baked from a second, public-domain source.
  *
  * Tools:
  * - search_bills: Search congressional bills by name, subject or keyword, ranked locally by title match
@@ -679,8 +680,32 @@ function collapse(s: string): string {
  * - get_members: Get current members of Congress
  * - get_votes: Get recent congressional votes (newest first)
  * - get_recent_bills: Most recently introduced / acted-on bills
+ * - committee_leadership: every standing committee in a chamber with its chair + ranking member
+ * - committee_members: one committee's full roster (party, rank, chair/ranking title)
+ * - member_committees: one member's committee assignments by bioguide id
+ *
+ * COMMITTEE DATA (fleet #2843): GovTrack's API has no committee-membership or
+ * committee-leadership endpoint at all, so committee_leadership/
+ * committee_members/member_committees are baked from a SEPARATE source —
+ * github.com/unitedstates/congress-legislators (committees-current.yaml,
+ * committee-membership-current.yaml, legislators-current.yaml), CC0 1.0
+ * Universal ("no rights reserved" per that repo's own LICENSE, verified
+ * live). Refreshed by scripts/refresh-congress-committees.mjs into
+ * ./committee-index-data.ts, which is NEVER value-imported here (fleet #2754
+ * — a baked table as a static import blew the gateway bundle 24.4->37.8MiB
+ * and caused edge 1102s on ~1/4 of requests) — it is registered in
+ * workers/gateway/src/pack-baked-indexes.json, uploaded to KV at deploy, and
+ * injected as `args._bakedIndex` on every call into this pack. This data
+ * changes on a committee-reshuffle cadence, not daily; `data_as_of` on every
+ * response is the source files' own last-commit date, not "now".
  */
 
+import type {
+  CommitteeRow,
+  CommitteeMemberRow,
+  MemberCommitteeAssignment,
+  MemberProfile,
+} from './committee-index-data.js';
 
 // Bound every fetch() in this pack to a fixed timeout — an upstream that
 // degrades without erroring would otherwise hold the Worker in `await fetch()`
@@ -830,6 +855,243 @@ function formatVote(v: RawVote) {
   };
 }
 
+// --- Baked committee index (fleet #2843) ---
+//
+// NEVER value-import ./committee-index-data.js here — the type-only import
+// above is erased from the bundle; a value import is not (same trap as
+// mcps/arkansas-code/src/index.ts's AR_SECTIONS, fleet #2754).
+let COMMITTEES: CommitteeRow[] = [];
+let COMMITTEE_MEMBERSHIP: Record<string, CommitteeMemberRow[]> = {};
+let MEMBER_COMMITTEES: Record<string, MemberCommitteeAssignment[]> = {};
+let MEMBER_PROFILES: Record<string, MemberProfile> = {};
+let CONGRESS_DATA_AS_OF = '';
+let COMMITTEE_INDEX_LOADED = false;
+
+function ensureCommitteeIndex(args: Record<string, unknown>): void {
+  if (COMMITTEE_INDEX_LOADED) return;
+  const idx = args._bakedIndex as Record<string, unknown> | null | undefined;
+  const committees = idx?.COMMITTEES;
+  const membership = idx?.COMMITTEE_MEMBERSHIP;
+  const memberCommittees = idx?.MEMBER_COMMITTEES;
+  const memberProfiles = idx?.MEMBER_PROFILES;
+  const dataAsOf = idx?.CONGRESS_DATA_AS_OF;
+  const ok =
+    Array.isArray(committees) &&
+    committees.length > 0 &&
+    typeof membership === 'object' &&
+    membership !== null &&
+    typeof memberCommittees === 'object' &&
+    memberCommittees !== null &&
+    typeof memberProfiles === 'object' &&
+    memberProfiles !== null &&
+    typeof dataAsOf === 'string' &&
+    dataAsOf.length > 0;
+  if (!ok) {
+    // Loud on purpose, same posture as ar-code's ensureIndex: a missing or
+    // malformed baked index is a server-side KV fault, not "no committees
+    // exist" — collapsing the two would be exactly the silent-empty-array
+    // trap docs/silent-zero-policy.md holds every pack to.
+    throw new Error(
+      `congress: the baked committee index is unavailable (${idx == null ? 'not injected' : 'malformed'}). ` +
+        'The gateway loads it from KV on the first call into committee_leadership/committee_members/member_committees; ' +
+        'this is a server-side fault, not an empty roster — retry shortly. search_bills/get_bill/get_members/get_votes/get_recent_bills are unaffected (they call GovTrack live and never touch this index).',
+    );
+  }
+  COMMITTEES = committees as CommitteeRow[];
+  COMMITTEE_MEMBERSHIP = membership as Record<string, CommitteeMemberRow[]>;
+  MEMBER_COMMITTEES = memberCommittees as Record<string, MemberCommitteeAssignment[]>;
+  MEMBER_PROFILES = memberProfiles as Record<string, MemberProfile>;
+  CONGRESS_DATA_AS_OF = dataAsOf;
+  COMMITTEE_INDEX_LOADED = true;
+}
+
+const VALID_CHAMBERS = new Set(['house', 'senate', 'joint']);
+
+/**
+ * Chair/ranking member resolution: prefer the explicit title (handles
+ * "Chair"/"Chairman"/"Chairwoman" and "Ranking Member"); fall back to
+ * majority/minority rank 1 for the handful of caucuses and select
+ * committees (e.g. the Senate Intelligence/Ethics committees, the Joint
+ * Commission on Security and Cooperation in Europe) that the source data
+ * does not label with an explicit title.
+ */
+function resolveLeadership(members: CommitteeMemberRow[]): {
+  chair: CommitteeMemberRow | null;
+  ranking_member: CommitteeMemberRow | null;
+} {
+  const chair =
+    members.find((m) => typeof m.title === 'string' && /^Chair/i.test(m.title)) ??
+    members.find((m) => m.party_role === 'majority' && m.rank === 1) ??
+    null;
+  const ranking =
+    members.find((m) => m.title === 'Ranking Member') ??
+    members.find((m) => m.party_role === 'minority' && m.rank === 1) ??
+    null;
+  return { chair, ranking_member: ranking };
+}
+
+/** Words that appear in nearly every committee name and carry no identifying signal. */
+const COMMITTEE_NAME_STOPWORDS = new Set([
+  'house', 'senate', 'joint', 'committee', 'committees', 'on', 'the', 'select',
+  'permanent', 'special', 'of', 'congress', 'united', 'states', 'us', 'subcommittee',
+  'and', 'for',
+]);
+
+function normalizeCommitteeName(s: string): string[] {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter((w) => w && !COMMITTEE_NAME_STOPWORDS.has(w));
+}
+
+/** Full-committee (not subcommittee) name search — every query word must appear in (or be a prefix/suffix of) a candidate word. */
+function findCommitteesByName(name: string, chamber: string | undefined): CommitteeRow[] {
+  const qWords = normalizeCommitteeName(name);
+  if (qWords.length === 0) return [];
+  return COMMITTEES.filter((c) => {
+    if (chamber && c.chamber !== chamber) return false;
+    const cWords = normalizeCommitteeName(c.name);
+    return qWords.every((w) => cWords.some((cw) => cw === w || cw.startsWith(w) || w.startsWith(cw)));
+  });
+}
+
+function findCommitteeById(id: string): CommitteeRow | undefined {
+  const norm = id.trim().toUpperCase();
+  return COMMITTEES.find((c) => c.id.toUpperCase() === norm);
+}
+
+function buildFullCommittee(c: CommitteeRow) {
+  const members = COMMITTEE_MEMBERSHIP[c.id] ?? [];
+  const { chair, ranking_member } = resolveLeadership(members);
+  return {
+    id: c.id,
+    name: c.name,
+    chamber: c.chamber,
+    url: c.url,
+    minority_url: c.minority_url,
+    jurisdiction: c.jurisdiction,
+    chair,
+    ranking_member,
+    member_count: members.length,
+    members,
+    subcommittees: c.subcommittees,
+  };
+}
+
+function committeeLeadership(args: Record<string, unknown>) {
+  ensureCommitteeIndex(args);
+  const chamberArg = typeof args.chamber === 'string' ? args.chamber.trim().toLowerCase() : undefined;
+  if (chamberArg && !VALID_CHAMBERS.has(chamberArg)) {
+    return { error: `chamber must be "house", "senate" or "joint" — got ${JSON.stringify(args.chamber)}`, chamber: args.chamber ?? null };
+  }
+  const committees = COMMITTEES.filter((c) => !chamberArg || c.chamber === chamberArg);
+  return {
+    chamber: chamberArg ?? 'all',
+    congress: 119,
+    data_as_of: CONGRESS_DATA_AS_OF,
+    source: 'github.com/unitedstates/congress-legislators (public domain, CC0 1.0 Universal)',
+    total: committees.length,
+    committees: committees.map((c) => {
+      const members = COMMITTEE_MEMBERSHIP[c.id] ?? [];
+      const { chair, ranking_member } = resolveLeadership(members);
+      return {
+        id: c.id,
+        name: c.name,
+        chamber: c.chamber,
+        url: c.url,
+        chair,
+        ranking_member,
+        member_count: members.length,
+      };
+    }),
+  };
+}
+
+function committeeMembers(args: Record<string, unknown>) {
+  ensureCommitteeIndex(args);
+  const chamberArg = typeof args.chamber === 'string' ? args.chamber.trim().toLowerCase() : undefined;
+  if (chamberArg && !VALID_CHAMBERS.has(chamberArg)) {
+    return { error: `chamber must be "house", "senate" or "joint" — got ${JSON.stringify(args.chamber)}`, chamber: args.chamber ?? null };
+  }
+  const idArg = typeof args.committee_id === 'string' && args.committee_id.trim() ? args.committee_id.trim() : undefined;
+  const nameArg = typeof args.name === 'string' && args.name.trim() ? args.name.trim() : undefined;
+  if (!idArg && !nameArg) {
+    return { error: 'Pass committee_id (e.g. "HSWM") or name (e.g. "Ways and Means", "Appropriations") — call committee_leadership first to see every valid id/name.' };
+  }
+
+  if (idArg) {
+    const top = findCommitteeById(idArg);
+    if (top) return { data_as_of: CONGRESS_DATA_AS_OF, ...buildFullCommittee(top) };
+    for (const c of COMMITTEES) {
+      const sub = c.subcommittees.find((s) => s.id.toUpperCase() === idArg.toUpperCase());
+      if (sub) {
+        const members = COMMITTEE_MEMBERSHIP[sub.id] ?? [];
+        const { chair, ranking_member } = resolveLeadership(members);
+        return {
+          data_as_of: CONGRESS_DATA_AS_OF,
+          id: sub.id,
+          name: `${c.name} Subcommittee on ${sub.name}`,
+          chamber: c.chamber,
+          parent_committee_id: c.id,
+          parent_committee_name: c.name,
+          chair,
+          ranking_member,
+          member_count: members.length,
+          members,
+        };
+      }
+    }
+    return {
+      found: false,
+      error: `No committee or subcommittee with id "${idArg}". Call committee_leadership to list valid ids.`,
+      committee_id: idArg,
+    };
+  }
+
+  const matches = findCommitteesByName(nameArg!, chamberArg);
+  if (matches.length === 0) {
+    return {
+      found: false,
+      error: `No committee name matched "${nameArg}"${chamberArg ? ` in the ${chamberArg}` : ''}. Try a shorter name (e.g. "Appropriations", "Judiciary", "Ways and Means"), or pass chamber to disambiguate.`,
+      name: nameArg,
+    };
+  }
+  if (matches.length === 1) {
+    return { data_as_of: CONGRESS_DATA_AS_OF, ...buildFullCommittee(matches[0]) };
+  }
+  return {
+    data_as_of: CONGRESS_DATA_AS_OF,
+    ambiguous: true,
+    note: `"${nameArg}" matched ${matches.length} committees (one per chamber, usually) — pass chamber: "house" or "senate" to pick one.`,
+    matches: matches.map(buildFullCommittee),
+  };
+}
+
+function memberCommittees(args: Record<string, unknown>) {
+  ensureCommitteeIndex(args);
+  const bioguide = typeof args.bioguide_id === 'string' ? args.bioguide_id.trim().toUpperCase() : undefined;
+  if (!bioguide) {
+    return { error: 'Pass bioguide_id — a Congress.gov/GovInfo "bioguide" id, e.g. "N000015" for Richard Neal, "G000386" for Chuck Grassley.' };
+  }
+  const assignments = MEMBER_COMMITTEES[bioguide];
+  if (!assignments || assignments.length === 0) {
+    return {
+      found: false,
+      error: `No committee assignments found for bioguide "${bioguide}". This covers the current (119th) Congress only; check the id is correct and the member currently serves.`,
+      bioguide_id: bioguide,
+    };
+  }
+  return {
+    data_as_of: CONGRESS_DATA_AS_OF,
+    bioguide_id: bioguide,
+    profile: MEMBER_PROFILES[bioguide] ?? null,
+    total: assignments.length,
+    committees: assignments,
+  };
+}
+
 // --- Tool definitions ---
 
 const tools: McpToolExport['tools'] = [
@@ -916,6 +1178,42 @@ const tools: McpToolExport['tools'] = [
       },
     },
   },
+  {
+    name: 'committee_leadership',
+    description:
+      'ANSWERS "who chairs X committee" / "who are the ranking members of every House committee" / "list of committee chairs in Congress" — returns EVERY standing committee in one chamber (or all three chambers) of the 119th Congress with its chair and ranking member (name, party, bioguide id). Pass chamber to scope to "house", "senate" or "joint"; omit it for all three. For one committee\'s FULL roster (every member, not just the chair/ranking pair) use committee_members instead. SOURCE: github.com/unitedstates/congress-legislators (public domain), baked periodically — NOT GovTrack, which has no committee-leadership endpoint at all. data_as_of in the response is the source data\'s own last-update date.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chamber: { type: 'string', description: '"house", "senate" or "joint". Omit to return every chamber.' },
+      },
+    },
+  },
+  {
+    name: 'committee_members',
+    description:
+      'ANSWERS "who is on the House Appropriations committee" / "roster of the Senate Judiciary committee" / "Democratic members of Ways and Means" — returns one committee\'s full membership with each member\'s party, rank and title (Chair / Ranking Member / plain member), plus the committee\'s chair, ranking member and list of subcommittees. Identify the committee by committee_id (the exact id from committee_leadership, e.g. "HSWM" for House Ways and Means, or a subcommittee id like "HSWM05") OR by name (e.g. "Appropriations", "Ways and Means", "Judiciary") — a name with no chamber that matches committees in BOTH the House and Senate (e.g. "Appropriations") returns both as `matches` rather than guessing; pass chamber to pick one directly. For the chair/ranking member of EVERY committee at once, use committee_leadership instead — it is cheaper when you do not need the full roster. SOURCE: github.com/unitedstates/congress-legislators (public domain), baked periodically, current (119th) Congress only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        committee_id: { type: 'string', description: 'Exact committee or subcommittee id, e.g. "HSWM" (House Ways and Means) or "SSJU" (Senate Judiciary). Takes priority over name.' },
+        name: { type: 'string', description: 'Committee name or partial name to search for, e.g. "Appropriations", "Judiciary", "Foreign Affairs".' },
+        chamber: { type: 'string', description: 'Optional: "house", "senate" or "joint" — disambiguates a name that matches more than one chamber.' },
+      },
+    },
+  },
+  {
+    name: 'member_committees',
+    description:
+      'ANSWERS "what committees is X on" / "committee assignments for Senator X" — returns every committee and subcommittee assignment (committee name, chamber, rank, title) for one member of the 119th Congress, identified by their bioguide id (the standard Congress.gov/GovInfo member identifier, e.g. "N000015" for Richard Neal — committee_leadership and committee_members both return bioguide ids for the members they list, so look a member up there first if you only have a name). SOURCE: github.com/unitedstates/congress-legislators (public domain), baked periodically, current Congress only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bioguide_id: { type: 'string', description: 'The member\'s bioguide id, e.g. "N000015".' },
+      },
+      required: ['bioguide_id'],
+    },
+  },
 ];
 
 // --- callTool dispatcher ---
@@ -936,6 +1234,12 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         args.congress as number | undefined,
         (args.limit as number) ?? 20,
       );
+    case 'committee_leadership':
+      return committeeLeadership(args);
+    case 'committee_members':
+      return committeeMembers(args);
+    case 'member_committees':
+      return memberCommittees(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
