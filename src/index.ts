@@ -671,29 +671,59 @@ function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 /**
- * Congress MCP — US Congress data via GovTrack API (free, no auth required)
- * plus committee rosters/leadership baked from a second, public-domain source.
+ * Congress MCP — US Congress bill/law/member data via the official
+ * congress.gov API (Library of Congress, api.data.gov-fronted) plus
+ * committee rosters/leadership baked from a second, public-domain source.
  *
  * Tools:
- * - search_bills: Search congressional bills by name, subject or keyword, ranked locally by title match
- * - get_bill: Get a single bill by GovTrack bill ID
- * - get_members: Get current members of Congress
- * - get_votes: Get recent congressional votes (newest first)
- * - get_recent_bills: Most recently introduced / acted-on bills
+ * - search_bills: Search congressional bills by name, subject or keyword — GovInfo (GPO) full-text search over bill text, locally re-ranked by title match
+ * - get_bill: Get a single bill by congress + bill type + number, from congress.gov
+ * - get_public_laws: Public (or private) laws enacted in one Congress, from congress.gov
+ * - get_members: Get current members of Congress, from congress.gov
+ * - get_votes: NOT AVAILABLE — see note below
+ * - get_recent_bills: Most recently introduced / acted-on bills, from congress.gov
  * - committee_leadership: every standing committee in a chamber with its chair + ranking member
  * - committee_members: one committee's full roster (party, rank, chair/ranking title)
  * - member_committees: one member's committee assignments by bioguide id
  *
- * COMMITTEE DATA (fleet #2843): GovTrack's API has no committee-membership or
- * committee-leadership endpoint at all, so committee_leadership/
- * committee_members/member_committees are baked from a SEPARATE source —
- * github.com/unitedstates/congress-legislators (committees-current.yaml,
- * committee-membership-current.yaml, legislators-current.yaml), CC0 1.0
- * Universal ("no rights reserved" per that repo's own LICENSE, verified
- * live). Refreshed by scripts/refresh-congress-committees.mjs into
- * ./committee-index-data.ts, which is NEVER value-imported here (fleet #2754
- * — a baked table as a static import blew the gateway bundle 24.4->37.8MiB
- * and caused edge 1102s on ~1/4 of requests) — it is registered in
+ * MIGRATION OFF GOVTRACK (fleet #3164, 2026-10-16): govtrack.us now answers
+ * EVERY endpoint — /bill, /role, /vote — with a Cloudflare "Just a moment..."
+ * challenge page served as HTTP 403, confirmed live on all of search_bills,
+ * get_bill, get_members, get_recent_bills. Per standing policy we do not
+ * evade a bot wall (no UA spoofing, no proxies, no IP rotation), so this pack
+ * now calls the official sources instead:
+ *   - congress.gov (api.congress.gov/v3) for get_bill, get_recent_bills,
+ *     get_public_laws and get_members — the Library of Congress's own API.
+ *   - GovInfo (api.govinfo.gov), the GPO's full-text search over the BILLS
+ *     collection, for search_bills — congress.gov's own /bill endpoint has NO
+ *     free-text query parameter (browsing/filtering only), so a keyword
+ *     search has no congress.gov equivalent; GovInfo is the GPO's official
+ *     full-text index of the same bill documents and is what congress.gov's
+ *     own search box uses.
+ * Both are api.data.gov-umbrella APIs — the SAME key authenticates both
+ * (reference_datagov_key_universal) — injected automatically as `_apiKey`
+ * when this pack is wired with `platformKeyEnv: 'PLATFORM_DATAGOV_KEY'` in
+ * the gateway manifest (already backing 15+ other federal packs; no new
+ * secret was minted for this).
+ *
+ * get_votes is NOT migrated and now fails fast with an explicit "not
+ * available" error instead of making a dead round-trip to GovTrack: the
+ * official congress.gov API has no roll-call-vote endpoint covering BOTH
+ * chambers (only a House-only one), so a partial replacement would silently
+ * drop every Senate vote behind a clean 200 — worse than the current loud
+ * failure. Left as a known gap for a follow-up task.
+ *
+ * COMMITTEE DATA (fleet #2843): neither congress.gov nor GovTrack has a
+ * committee-membership or committee-leadership endpoint at all, so
+ * committee_leadership/committee_members/member_committees are baked from a
+ * SEPARATE source — github.com/unitedstates/congress-legislators
+ * (committees-current.yaml, committee-membership-current.yaml,
+ * legislators-current.yaml), CC0 1.0 Universal ("no rights reserved" per
+ * that repo's own LICENSE, verified live). Refreshed by
+ * scripts/refresh-congress-committees.mjs into ./committee-index-data.ts,
+ * which is NEVER value-imported here (fleet #2754 — a baked table as a
+ * static import blew the gateway bundle 24.4->37.8MiB and caused edge 1102s
+ * on ~1/4 of requests) — it is registered in
  * workers/gateway/src/pack-baked-indexes.json, uploaded to KV at deploy, and
  * injected as `args._bakedIndex` on every call into this pack. This data
  * changes on a committee-reshuffle cadence, not daily; `data_as_of` on every
@@ -715,143 +745,152 @@ async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response>
   return fetchWithTimeout(url, init ?? {}, 'Congress');
 }
 
+// --- congress.gov (official, api.data.gov-fronted) ---
+const CONGRESS_GOV_BASE = 'https://api.congress.gov/v3';
+// --- GovInfo (GPO), used ONLY for search_bills's full-text keyword search ---
+const GOVINFO_SEARCH_URL = 'https://api.govinfo.gov/search';
 
-const BASE_URL = 'https://www.govtrack.us/api/v2';
+const API_KEY_HINT =
+  'Pass a free api.data.gov key as `_apiKey` (https://api.data.gov/signup/) — the same key ' +
+  'authenticates both congress.gov and GovInfo. Called through the Pipeworx gateway this is ' +
+  'supplied automatically and this message should not be reachable there.';
 
-// --- Raw API types ---
+/** Every GovTrack-era tool now requires an API key; say so plainly rather than calling out keyless and failing on a cryptic 403. */
+function requireApiKey(args: Record<string, unknown>): string {
+  const key = typeof args._apiKey === 'string' && args._apiKey.trim() ? args._apiKey.trim() : undefined;
+  if (!key) {
+    throw new Error(`congress: this tool requires an API key. ${API_KEY_HINT}`);
+  }
+  return key;
+}
 
-type RawBill = {
-  id: number;
-  bill_type?: string | null;
-  bill_type_label?: string | null;
-  number?: number | null;
-  congress?: number | null;
+function congressGovUrl(path: string, params: Record<string, string | number | undefined>, apiKey: string): string {
+  const url = new URL(CONGRESS_GOV_BASE + path);
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('api_key', apiKey);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== '') url.searchParams.set(k, String(v));
+  }
+  return url.toString();
+}
+
+async function congressGovFetch<T>(
+  path: string,
+  params: Record<string, string | number | undefined>,
+  apiKey: string,
+): Promise<T> {
+  const res = await pwFetch(congressGovUrl(path, params, apiKey));
+  if (!res.ok) throw await httpError(res, 'congress.gov API error');
+  return parseJson<T>(res, 'congress.gov');
+}
+
+type GovInfoSearchResult = {
   title?: string | null;
-  title_without_number?: string | null;
-  current_status?: string | null;
-  current_status_label?: string | null;
-  current_status_date?: string | null;
-  introduced_date?: string | null;
-  link?: string | null;
-  sponsor?: {
-    id?: number | null;
-    name?: string | null;
-    sortname?: string | null;
-  } | null;
-  /** [kind, as_of_status, text] triples — display, short, short-partial and official titles. */
-  titles?: Array<Array<string | null>> | null;
+  packageId?: string | null;
+  dateIssued?: string | null;
+  governmentAuthor?: string[] | null;
 };
 
-type RawMemberRole = {
-  id?: number | null;
-  person?: {
-    id?: number | null;
-    name?: string | null;
-    sortname?: string | null;
-    gender?: string | null;
-    gender_label?: string | null;
-    birthday?: string | null;
-    link?: string | null;
-  } | null;
-  role_type?: string | null;
-  role_type_label?: string | null;
+type GovInfoSearchResponse = {
+  count?: number | null;
+  results?: GovInfoSearchResult[] | null;
+};
+
+/** `BILLS-119hr1ih` -> {congress:119, billType:'hr', number:1, version:'ih'} */
+function parsePackageId(id: string): { congress: number; billType: string; number: number; version: string } | null {
+  const m = /^BILLS-(\d+)([a-z]+)(\d+)([a-z]+)$/.exec(id);
+  if (!m) return null;
+  return { congress: Number(m[1]), billType: m[2], number: Number(m[3]), version: m[4] };
+}
+
+async function govInfoSearchBills(query: string, apiKey: string, pageSize: number): Promise<GovInfoSearchResponse> {
+  const url = new URL(GOVINFO_SEARCH_URL);
+  url.searchParams.set('api_key', apiKey);
+  const res = await pwFetch(url.toString(), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query: `collection:BILLS AND ${query}`,
+      pageSize: Math.min(Math.max(1, pageSize), 100),
+      offsetMark: '*',
+      sorts: [{ field: 'relevancy', sortOrder: 'DESC' }],
+    }),
+  });
+  if (!res.ok) throw await httpError(res, 'GovInfo search error');
+  return parseJson<GovInfoSearchResponse>(res, 'GovInfo');
+}
+
+// --- Raw API types (congress.gov) ---
+
+type RawCongressBill = {
+  congress?: number | null;
+  type?: string | null;
+  number?: string | null;
+  title?: string | null;
+  originChamber?: string | null;
+  introducedDate?: string | null;
+  updateDate?: string | null;
+  legislationUrl?: string | null;
+  latestAction?: { actionDate?: string | null; text?: string | null } | null;
+  sponsors?: Array<{
+    bioguideId?: string | null;
+    fullName?: string | null;
+    party?: string | null;
+    state?: string | null;
+  }> | null;
+  laws?: Array<{ number?: string | null; type?: string | null }> | null;
+};
+
+type CongressGovListResponse<T> = {
+  bills?: T[] | null;
+  members?: T[] | null;
+  pagination?: { count?: number | null } | null;
+};
+
+type RawCongressMember = {
+  bioguideId?: string | null;
+  name?: string | null;
+  partyName?: string | null;
   state?: string | null;
-  state_name?: string | null;
   district?: number | null;
-  party?: string | null;
-  title?: string | null;
-  title_long?: string | null;
-  startdate?: string | null;
-  enddate?: string | null;
-  congress_numbers?: number[] | null;
-  current?: boolean | null;
-};
-
-type RawVote = {
-  id?: number | null;
-  congress?: number | null;
-  session?: number | null;
-  chamber?: string | null;
-  chamber_label?: string | null;
-  number?: number | null;
-  question?: string | null;
-  question_details?: string | null;
-  result?: string | null;
-  category?: string | null;
-  category_label?: string | null;
-  created?: string | null;
-  total_plus?: number | null;
-  total_minus?: number | null;
-  total_other?: number | null;
-  link?: string | null;
-  related_bill?: {
-    id?: number | null;
-    title?: string | null;
-  } | null;
-};
-
-type GovTrackListResponse<T> = {
-  meta?: { total_count?: number; offset?: number; limit?: number } | null;
-  objects: T[];
+  terms?: { item?: Array<{ chamber?: string | null; startYear?: number | null }> } | null;
+  url?: string | null;
 };
 
 // --- Formatters ---
 
-function formatBill(b: RawBill) {
+/** Shape-compatible with the old GovTrack-era `formatBill` output (same keys), so existing callers keep working — `status`/`status_label` now carry congress.gov's free-text `latestAction` since congress.gov has no coded status like GovTrack's `current_status`. */
+function formatCongressBill(b: RawCongressBill) {
+  const typeLower = (b.type ?? '').toLowerCase();
   return {
-    id: b.id,
-    bill_type: b.bill_type ?? null,
-    bill_type_label: b.bill_type_label ?? null,
-    number: b.number ?? null,
+    id: null,
+    bill_type: typeLower || null,
+    bill_type_label: BILL_TYPE_LABELS[typeLower] ?? b.type ?? null,
+    number: b.number != null ? Number(b.number) : null,
     congress: b.congress ?? null,
     title: b.title ?? null,
-    title_without_number: b.title_without_number ?? null,
-    status: b.current_status ?? null,
-    status_label: b.current_status_label ?? null,
-    status_date: b.current_status_date ?? null,
-    introduced_date: b.introduced_date ?? null,
-    sponsor_name: b.sponsor?.name ?? null,
-    link: b.link ?? null,
+    title_without_number: b.title ?? null,
+    status: null,
+    status_label: b.latestAction?.text ?? null,
+    status_date: b.latestAction?.actionDate ?? null,
+    introduced_date: b.introducedDate ?? null,
+    sponsor_name: b.sponsors?.[0]?.fullName ?? null,
+    became_law: b.laws && b.laws.length > 0 ? b.laws[0] : null,
+    link: b.legislationUrl ?? null,
   };
 }
 
-function formatMember(r: RawMemberRole) {
+function formatCongressMember(m: RawCongressMember) {
+  const latestTerm = m.terms?.item?.[m.terms.item.length - 1];
   return {
-    role_id: r.id ?? null,
-    person_id: r.person?.id ?? null,
-    name: r.person?.name ?? null,
-    sortname: r.person?.sortname ?? null,
-    gender: r.person?.gender_label ?? null,
-    birthday: r.person?.birthday ?? null,
-    role_type: r.role_type ?? null,
-    title: r.title_long ?? r.title ?? null,
-    party: r.party ?? null,
-    state: r.state ?? null,
-    state_name: r.state_name ?? null,
-    district: r.district ?? null,
-    startdate: r.startdate ?? null,
-    enddate: r.enddate ?? null,
-    link: r.person?.link ?? null,
-  };
-}
-
-function formatVote(v: RawVote) {
-  return {
-    id: v.id ?? null,
-    congress: v.congress ?? null,
-    session: v.session ?? null,
-    chamber: v.chamber_label ?? v.chamber ?? null,
-    number: v.number ?? null,
-    question: v.question ?? null,
-    question_details: v.question_details ?? null,
-    result: v.result ?? null,
-    category: v.category_label ?? v.category ?? null,
-    created: v.created ?? null,
-    yes_votes: v.total_plus ?? null,
-    no_votes: v.total_minus ?? null,
-    other_votes: v.total_other ?? null,
-    related_bill_title: v.related_bill?.title ?? null,
-    link: v.link ?? null,
+    bioguide_id: m.bioguideId ?? null,
+    name: m.name ?? null,
+    party: m.partyName ?? null,
+    state: m.state ?? null,
+    district: m.district ?? null,
+    chamber: latestTerm?.chamber ?? null,
+    term_start_year: latestTerm?.startYear ?? null,
+    congress_gov_api_url: m.url ?? null,
   };
 }
 
@@ -894,7 +933,7 @@ function ensureCommitteeIndex(args: Record<string, unknown>): void {
     throw new Error(
       `congress: the baked committee index is unavailable (${idx == null ? 'not injected' : 'malformed'}). ` +
         'The gateway loads it from KV on the first call into committee_leadership/committee_members/member_committees; ' +
-        'this is a server-side fault, not an empty roster — retry shortly. search_bills/get_bill/get_members/get_votes/get_recent_bills are unaffected (they call GovTrack live and never touch this index).',
+        'this is a server-side fault, not an empty roster — retry shortly. search_bills/get_bill/get_members/get_recent_bills/get_public_laws are unaffected (they call congress.gov/GovInfo live and never touch this index).',
     );
   }
   COMMITTEES = committees as CommitteeRow[];
@@ -1098,7 +1137,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'search_bills',
     description:
-      'ANSWERS "what bills about X has Congress introduced" / "recent congressional bills on X" / "federal legislation about X" / "find the <Named> Act" — searches US FEDERAL congressional bills (US House & Senate, national laws) BY BILL NAME, SUBJECT OR KEYWORD, including recently introduced ones. Results are RANKED by how well each bill\'s titles match the query — exact title first, then a title containing the phrase, then all query words, then partial overlap, newer Congress first on ties — so the first result is the best title match and each bill carries its match tier. The current Congress and the two before it are searched in depth plus the first page of matches from every earlier Congress; pass `congress` to search one Congress exhaustively (e.g. a bill from the 111th). Prefer this over a date-sorted recent-bills listing whenever the question names a topic or a bill, since only this tool can filter by it. Returns bill type, number, title, status, sponsor, and introduction date. Use get_bill with congress + bill_type + number for full details. NOTE: this is the US Congress (federal) ONLY — for STATE legislature bills (e.g. California, Texas, New York, or any US state legislation) use legiscan or openstates instead, not this tool.',
+      'ANSWERS "what bills about X has Congress introduced" / "recent congressional bills on X" / "federal legislation about X" / "find the <Named> Act" — searches US FEDERAL congressional bills (US House & Senate, national laws) BY BILL NAME, SUBJECT OR KEYWORD, including recently introduced ones. Full-text search is via GovInfo (the GPO\'s index of the same bill documents congress.gov itself searches — congress.gov\'s own /bill endpoint has no keyword query at all), then RE-RANKED locally by how well each bill\'s title matches the query — exact title first, then a title containing the phrase, then all query words, then partial overlap — so the first result is the best title match and each bill carries its match tier. Pass `congress` to restrict to one Congress (filtered locally against the search results — may miss a match if it falls outside GovInfo\'s own top results for that query). Prefer this over a date-sorted recent-bills listing whenever the question names a topic or a bill. Returns bill type, number, title, status, sponsor, and introduction date (via congress.gov). Use get_bill with congress + bill_type + number for full details. Requires an API key (see get_bill). NOTE: this is the US Congress (federal) ONLY — for STATE legislature bills (e.g. California, Texas, New York, or any US state legislation) use legiscan or openstates instead, not this tool.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1109,8 +1148,7 @@ const tools: McpToolExport['tools'] = [
         limit: { type: 'number', description: 'Number of results to return (default: 10, max: 100)' },
         congress: {
           type: 'number',
-          description:
-            'Optional Congress number (e.g. 111) to search exhaustively. Without it the three most recent Congresses are searched in depth and every earlier one only shallowly, so name a Congress when the bill is older than about six years.',
+          description: 'Optional Congress number (e.g. 111) to restrict results to, filtered locally against the search results.',
         },
       },
       required: ['query'],
@@ -1119,7 +1157,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'get_bill',
     description:
-      'Look up one congressional bill from GovTrack by its real-world identifier — congress number, bill type and bill number, e.g. the 118th Congress H.R. 1. Returns title, sponsor, current status with its date, introduced date and the GovTrack link. Does NOT return bill text, cosponsors, committee assignments or vote history.',
+      'Look up one congressional bill from congress.gov (the Library of Congress\'s official API) by its real-world identifier — congress number, bill type and bill number, e.g. the 118th Congress H.R. 1. Returns title, sponsor, current status (congress.gov\'s free-text `latestAction`) with its date, introduced date, whether/which law it became, and the congress.gov link. Does NOT return bill text, cosponsors, committee assignments or vote history. Requires an API key: a free api.data.gov key works — supplied automatically when called through the Pipeworx gateway.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1127,22 +1165,31 @@ const tools: McpToolExport['tools'] = [
         bill_type: {
           type: 'string',
           description:
-            "GovTrack bill type: house_bill, senate_bill, house_resolution, senate_resolution, house_joint_resolution, senate_joint_resolution, house_concurrent_resolution or senate_concurrent_resolution. 'hr' and 'h.r.' are accepted as house_bill, 's' as senate_bill.",
+            "Bill type: hr, s, hres, sres, hjres, sjres, hconres or sconres (congress.gov's own short codes). The long GovTrack-era forms (house_bill, senate_bill, ...) and 'h.r.' are also accepted.",
         },
         number: { type: 'number', description: 'Bill number within that congress, e.g. 1 for H.R. 1' },
-        id: {
-          type: 'number',
-          description:
-            'GovTrack internal numeric bill id. Legacy — v2 no longer returns it on any endpoint, so prefer congress + bill_type + number.',
-        },
       },
       required: ['congress', 'bill_type', 'number'],
     },
   },
   {
+    name: 'get_public_laws',
+    description:
+      'ANSWERS "how many public laws has the 119th Congress passed" / "most recent public law" / "list of laws enacted this Congress" — returns public (or private) laws enacted in one Congress, from congress.gov\'s official /law endpoint. GovTrack never had an equivalent endpoint at all. Returns the total count, the most recent law (number, originating bill, title, enactment date), and the list of laws (newest first). Requires an API key (see get_bill).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        congress: { type: 'number', description: 'Congress number, e.g. 119 for the 119th Congress (2025–2026).' },
+        law_type: { type: 'string', description: '"pub" (default, public laws) or "priv" (private laws).' },
+        limit: { type: 'number', description: 'Number of laws to return (default: 20, max: 100).' },
+      },
+      required: ['congress'],
+    },
+  },
+  {
     name: 'get_members',
     description:
-      'Get current members of Congress with their name, party, state, district (for representatives), and contact information.',
+      'Get current members of Congress with their name, party, state, district (for representatives), chamber and first term-start year, from congress.gov. Requires an API key (see get_bill).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1153,25 +1200,25 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'get_votes',
     description:
-      'Get recent congressional votes on bills, newest first. Returns question, result, chamber, vote counts (yes/no/abstain), date, and related bill.',
+      'NOT AVAILABLE. GovTrack, the only source this tool ever used, now answers every endpoint with a Cloudflare bot-challenge (HTTP 403), and congress.gov\'s official API has no roll-call-vote endpoint covering both the House and the Senate (only a House-only one) — so there is no complete official replacement yet. Calling this returns an explanatory error immediately; it is a known gap, not a transient fault.',
     inputSchema: {
       type: 'object',
       properties: {
-        limit: { type: 'number', description: 'Number of votes to return (default: 20, max: 100)' },
-        congress: { type: 'number', description: 'Congress number to filter by (e.g., 119)' },
+        limit: { type: 'number', description: 'Unused — this tool is not available.' },
+        congress: { type: 'number', description: 'Unused — this tool is not available.' },
       },
     },
   },
   {
     name: 'get_recent_bills',
     description:
-      'List the most recent congressional bills — newest first by introduction date or by latest action. This tool takes NO subject or keyword: it returns whatever Congress touched most recently, so it can only answer OPEN-ENDED recency questions — "what bills were introduced this week", "latest bills in Congress", "what is Congress working on now", "recent activity on bills". PREFER OVER congress_search_bills for exactly those (it ranks by keyword relevance and surfaces older bills). If the question NAMES a bill, act, or subject — "status of the NDAA", "the defense authorization bill", "bills about crypto" — use congress_search_bills instead, even when it asks for the CURRENT status: a named subject cannot be found in an unfiltered recency list, which is mostly routine post-office namings. Returns bill type, number, title, status, sponsor, and dates.',
+      'List the most recent congressional bills — newest first by introduction date or by latest update — from congress.gov. This tool takes NO subject or keyword: it returns whatever Congress touched most recently, so it can only answer OPEN-ENDED recency questions — "what bills were introduced this week", "latest bills in Congress", "what is Congress working on now", "recent activity on bills". PREFER OVER congress_search_bills for exactly those (it ranks by keyword relevance and surfaces older bills). If the question NAMES a bill, act, or subject — "status of the NDAA", "the defense authorization bill", "bills about crypto" — use congress_search_bills instead, even when it asks for the CURRENT status: a named subject cannot be found in an unfiltered recency list, which is mostly routine post-office namings. Returns bill type, number, title, status, sponsor, and dates. Requires an API key (see get_bill).',
     inputSchema: {
       type: 'object',
       properties: {
         by: {
           type: 'string',
-          description: 'Recency basis: "introduced" (default, newest introductions) or "activity" (most recent status change / latest action).',
+          description: 'Recency basis: "introduced" (default, newest introductions) or "activity" (most recent update / latest action).',
         },
         congress: { type: 'number', description: 'Congress number to filter by (e.g., 119 for 2025–2026). Omit for all.' },
         limit: { type: 'number', description: 'Number of bills to return (default: 20, max: 100)' },
@@ -1221,19 +1268,17 @@ const tools: McpToolExport['tools'] = [
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   switch (name) {
     case 'search_bills':
-      return searchBills(args.query as string, (args.limit as number) ?? 10, args.congress as number | undefined);
+      return searchBills(args);
     case 'get_bill':
       return getBill(args);
+    case 'get_public_laws':
+      return getPublicLaws(args);
     case 'get_members':
-      return getMembers((args.limit as number) ?? 50);
+      return getMembers(args);
     case 'get_votes':
-      return getVotes((args.limit as number) ?? 20, args.congress as number | undefined);
+      return getVotes();
     case 'get_recent_bills':
-      return getRecentBills(
-        typeof args.by === 'string' ? args.by : 'introduced',
-        args.congress as number | undefined,
-        (args.limit as number) ?? 20,
-      );
+      return getRecentBills(args);
     case 'committee_leadership':
       return committeeLeadership(args);
     case 'committee_members':
@@ -1247,58 +1292,24 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
 
 // --- Tool implementations ---
 
-// --- search_bills: candidate gathering + local ranking ---
+// --- search_bills: GovInfo full-text search + local title re-ranking ---
 //
-// GovTrack's `q` is a loose keyword match with NO relevance ordering. For
-// "Lower Energy Costs Act" it reports 4,348 matches and puts a 2014 salmon bill
-// first, while H.R. 1 (118th) — the bill literally so named — sits at position
-// 86 of the 285 matches inside its own Congress and outside the first 1,100 of
-// the unfiltered list. `order_by=relevance` is rejected outright and offsets
-// above 1000 are refused, so the unfiltered list can never be walked to it. A
-// model reads element 0 as the best match, so the old pass-through answered
-// about a DIFFERENT bill with a clean 200 (fleet #2170).
+// congress.gov's own /bill endpoint has NO free-text query parameter — it is
+// browse/filter only (congress, bill type, date range, sort), confirmed live
+// against its OpenAPI-documented parameters (fleet #3164). A Congress holds
+// ~20,000 bills, so there is no way to find one by keyword through that
+// endpoint short of paging through nearly all of them. GovInfo
+// (api.govinfo.gov), the GPO's full-text index of the same bill documents —
+// what congress.gov's own search box is built on — DOES support a query, so
+// that is what this calls; congress.gov itself is still used for every
+// detail field GovInfo's search result doesn't carry (sponsor, status).
 //
-// So: gather candidates per recent Congress (each Congress's own match set is
-// small enough to page), re-rank locally by title match, and say so in the
-// payload. Waves 2 and 3 only run while nothing yet matches the phrase, so a
-// subject query ("crypto") costs four upstream requests and a named bill that
-// is hiding deep costs at most sixteen.
-
-const GOVTRACK_PAGE = 100;
-const GOVTRACK_MAX_OFFSET = 1000; // GovTrack: "Offset > 1000 is not permitted."
-const RECENT_CONGRESSES = 3; // current + the two before it ≈ six years
-const DEEP_PAGES_PER_CONGRESS = 3; // wave 2: up to 300 candidates per recent Congress
-const OLDER_CONGRESSES = 6; // wave 3: one page each for the six Congresses before that
-const FIRST_GOVTRACK_CONGRESS = 93; // GovTrack's bill corpus starts at the 93rd (1973)
-const PINNED_MAX_PAGES = Math.floor(GOVTRACK_MAX_OFFSET / GOVTRACK_PAGE) + 1; // 11 pages ≈ 1,100 rows
-
-/**
- * The Congress sitting on `now`. A Congress convenes on Jan 3 of every odd
- * year; the 119th convened 2025-01-03. Takes the date as an argument because a
- * module-scope `new Date()` is 1970 in a Worker isolate.
- */
-function currentCongress(now: Date): number {
-  const year = now.getUTCFullYear();
-  const oddYear = year % 2 === 1 ? year : year - 1;
-  let congress = (oddYear - 1789) / 2 + 1;
-  if (year % 2 === 1 && now < new Date(Date.UTC(year, 0, 3))) congress -= 1;
-  return congress;
-}
-
-async function fetchBillPage(params: Record<string, string>): Promise<GovTrackListResponse<RawBill>> {
-  const res = await pwFetch(`${BASE_URL}/bill?${new URLSearchParams(params)}`);
-  if (!res.ok) throw await httpError(res, 'GovTrack API error');
-  return (await res.json()) as GovTrackListResponse<RawBill>;
-}
-
-/** Offsets of the pages AFTER the first, for a match set of `total` rows, capped at `maxPages` pages in all. */
-function laterPageOffsets(total: number, maxPages: number): number[] {
-  const offsets: number[] = [];
-  for (let off = GOVTRACK_PAGE; off < total && off <= GOVTRACK_MAX_OFFSET && offsets.length < maxPages - 1; off += GOVTRACK_PAGE) {
-    offsets.push(off);
-  }
-  return offsets;
-}
+// GovInfo's relevancy sort is already decent (verified live: "Lower Energy
+// Costs Act" puts H.R. 1 118th first), but each bill appears once PER
+// published version (introduced, reported, engrossed, enrolled, ...), so this
+// still dedupes by (congress, bill_type, number) and re-ranks locally by
+// title match, same tiers as before GovTrack: exact > phrase > all-words >
+// partial.
 
 /** Words that appear in nearly every bill title and carry no signal about WHICH bill is meant. */
 const TITLE_STOPWORDS = new Set([
@@ -1328,25 +1339,19 @@ function wordMatches(term: string, words: string[]): boolean {
 
 type MatchTier = 'exact' | 'phrase' | 'all_words' | 'partial' | 'none';
 
-function billTitles(b: RawBill): string[] {
-  const out = new Set<string>();
-  if (b.title_without_number) out.add(b.title_without_number);
-  for (const t of b.titles ?? []) {
-    const text = t?.[2];
-    if (typeof text === 'string' && text) out.add(text);
-  }
-  return [...out];
+/** GovInfo's `title` sometimes joins several short titles with "; " — score against each. */
+function candidateTitles(title: string | null | undefined): string[] {
+  if (!title) return [];
+  return title.split(';').map((t) => t.trim()).filter(Boolean);
 }
 
 /**
- * Score one bill against the query over ALL of its titles (display, short,
- * short-partial and official), so an alias like "TAPP American Resources Act"
- * finds H.R. 1 too. Tiers do not overlap: exact 400 > phrase 300–399 >
- * all_words 200–299 > partial 1–199 > none 0.
+ * Score one result's titles against the query. Tiers do not overlap: exact
+ * 400 > phrase 300–399 > all_words 200–299 > partial 1–199 > none 0.
  */
-function scoreBill(b: RawBill, qNorm: string, terms: string[]): { score: number; tier: MatchTier; matched_title: string | null } {
+function scoreTitle(titles: string[], qNorm: string, terms: string[]): { score: number; tier: MatchTier; matched_title: string | null } {
   let best: { score: number; tier: MatchTier; matched_title: string | null } = { score: 0, tier: 'none', matched_title: null };
-  for (const raw of billTitles(b)) {
+  for (const raw of titles) {
     const t = normalizeTitle(raw);
     if (!t) continue;
     let score = 0;
@@ -1373,190 +1378,169 @@ function scoreBill(b: RawBill, qNorm: string, terms: string[]): { score: number;
   return best;
 }
 
-function billKey(b: RawBill): string {
-  return `${b.congress ?? '?'}/${b.bill_type ?? '?'}/${b.number ?? '?'}`;
-}
-
 const SEARCH_RANKING_NOTE =
-  "Re-ranked locally by title match — exact title, then a title containing the phrase, then all query words, then partial overlap; ties go to the newer Congress. GovTrack's own result order is NOT by relevance and is not used.";
-const SEARCH_TOTAL_NOTE =
-  'GovTrack loose keyword-match count (any query word may match any of a bill\'s titles), not the number of bills about this subject or bearing this name.';
+  'Re-ranked locally by title match over GovInfo\'s full-text search results — exact title, then a title containing the phrase, then all query words, then partial overlap; ties go to GovInfo\'s own relevancy order.';
+const SEARCH_SOURCE_NOTE =
+  'Keyword matching is against GovInfo\'s full-text index of bill documents (congress.gov\'s own /bill endpoint has no free-text search); sponsor/status on each result come from congress.gov.';
 
-async function searchBills(query: string, limit: number, congress: number | undefined) {
+async function searchBills(args: Record<string, unknown>) {
+  const apiKey = requireApiKey(args);
+  const query = typeof args.query === 'string' ? args.query : '';
+  const limit = typeof args.limit === 'number' ? args.limit : 10;
+  const congress = typeof args.congress === 'number' ? args.congress : undefined;
   const count = Math.min(Math.max(1, limit), 100);
-  const base = { q: query, limit: String(GOVTRACK_PAGE) };
+  if (!query.trim()) return { error: 'Pass `query` — bill name, keywords or subject, e.g. "Lower Energy Costs Act" or "crypto".' };
+
   const qNorm = normalizeTitle(query);
   const terms = queryTerms(qNorm);
+  const resp = await govInfoSearchBills(query, apiKey, 100);
+  const results = resp.results ?? [];
 
-  const candidates = new Map<string, RawBill>();
-  const add = (pages: GovTrackListResponse<RawBill>[]) => {
-    for (const page of pages) {
-      for (const b of page.objects) {
-        const key = billKey(b);
-        if (!candidates.has(key)) candidates.set(key, b);
-      }
+  // Dedupe by (congress, bill_type, number) — one GovInfo hit per published
+  // version — keeping whichever version scores best against the query.
+  // `congress` filters LOCALLY (not a documented GovInfo query field) by
+  // discarding non-matching packageIds before scoring.
+  const best = new Map<string, { parsed: { congress: number; billType: string; number: number }; titles: string[]; score: ReturnType<typeof scoreTitle> }>();
+  for (const r of results) {
+    const parsed = r.packageId ? parsePackageId(r.packageId) : null;
+    if (!parsed) continue;
+    if (congress != null && parsed.congress !== congress) continue;
+    const titles = candidateTitles(r.title);
+    const score = scoreTitle(titles, qNorm, terms);
+    const key = `${parsed.congress}/${parsed.billType}/${parsed.number}`;
+    const existing = best.get(key);
+    if (!existing || score.score > existing.score.score) {
+      best.set(key, { parsed, titles, score });
     }
-  };
-  const phraseFound = () => {
-    for (const b of candidates.values()) if (scoreBill(b, qNorm, terms).score >= 300) return true;
-    return false;
-  };
-
-  let total: number;
-  let congressesSearched: Record<string, unknown>;
-
-  if (congress != null) {
-    const pinned = { ...base, congress: String(congress) };
-    const first = await fetchBillPage(pinned);
-    total = first.meta?.total_count ?? first.objects.length;
-    const rest = await Promise.all(
-      laterPageOffsets(total, PINNED_MAX_PAGES).map((off) => fetchBillPage({ ...pinned, offset: String(off) })),
-    );
-    add([first, ...rest]);
-    congressesSearched = {
-      exhaustive: [congress],
-      coverage:
-        candidates.size >= total
-          ? 'every loose match in this Congress was ranked'
-          : `first ${candidates.size} of ${total} loose matches were ranked — GovTrack refuses offsets above ${GOVTRACK_MAX_OFFSET}; narrow the query`,
-    };
-  } else {
-    const current = currentCongress(new Date());
-    const recent = Array.from({ length: RECENT_CONGRESSES }, (_, i) => current - i);
-
-    // Wave 1: one page unfiltered (whatever GovTrack puts first, any Congress) + one page per recent Congress.
-    const [unfiltered, ...recentFirst] = await Promise.all([
-      fetchBillPage(base),
-      ...recent.map((c) => fetchBillPage({ ...base, congress: String(c) })),
-    ]);
-    total = unfiltered.meta?.total_count ?? unfiltered.objects.length;
-    add([unfiltered, ...recentFirst]);
-
-    // Wave 2: a named bill can sit deep inside its own Congress's match set (H.R. 1 was 86th of 285).
-    if (!phraseFound()) {
-      const deeper = recent.flatMap((c, i) =>
-        laterPageOffsets(recentFirst[i].meta?.total_count ?? 0, DEEP_PAGES_PER_CONGRESS).map((off) =>
-          fetchBillPage({ ...base, congress: String(c), offset: String(off) }),
-        ),
-      );
-      add(await Promise.all(deeper));
-    }
-
-    // Wave 3: the six Congresses before the recent window, one page each.
-    let older: number[] = [];
-    if (!phraseFound()) {
-      older = Array.from({ length: OLDER_CONGRESSES }, (_, i) => current - RECENT_CONGRESSES - i).filter(
-        (c) => c >= FIRST_GOVTRACK_CONGRESS,
-      );
-      add(await Promise.all(older.map((c) => fetchBillPage({ ...base, congress: String(c) }))));
-    }
-
-    congressesSearched = {
-      in_depth: recent,
-      one_page: older,
-      plus: 'the first page of loose matches across every Congress',
-      hint: 'A bill older than the in-depth window may be missing; pass `congress` to search that Congress exhaustively.',
-    };
   }
 
-  const ranked = [...candidates.values()]
-    .map((b) => ({ b, m: scoreBill(b, qNorm, terms) }))
-    .sort(
-      (x, y) =>
-        y.m.score - x.m.score ||
-        (y.b.congress ?? 0) - (x.b.congress ?? 0) ||
-        (y.b.introduced_date ?? '').localeCompare(x.b.introduced_date ?? ''),
-    );
+  const ranked = [...best.values()].sort((x, y) => y.score.score - x.score.score || y.parsed.congress - x.parsed.congress);
   const top = ranked.slice(0, count);
+
+  // Enrich with congress.gov's own detail (sponsor, status, introduced date) —
+  // GovInfo's search result carries only title/date, not these fields.
+  const detailed = await Promise.all(
+    top.map(async ({ parsed, score }) => {
+      try {
+        const data = await congressGovFetch<{ bill: RawCongressBill }>(
+          `/bill/${parsed.congress}/${parsed.billType}/${parsed.number}`,
+          {},
+          apiKey,
+        );
+        return { ...formatCongressBill(data.bill), match: score.tier, matched_title: score.matched_title };
+      } catch {
+        // congress.gov detail fetch failed for this one result (rare — e.g. a
+        // transient 5xx) — still report the match from GovInfo rather than
+        // dropping it silently.
+        return {
+          bill_type: parsed.billType,
+          number: parsed.number,
+          congress: parsed.congress,
+          title: score.matched_title,
+          match: score.tier,
+          matched_title: score.matched_title,
+          detail_fetch_failed: true,
+        };
+      }
+    }),
+  );
 
   return {
     query,
-    total,
-    total_note: SEARCH_TOTAL_NOTE,
-    returned: top.length,
+    total: resp.count ?? results.length,
+    source_note: SEARCH_SOURCE_NOTE,
+    returned: detailed.length,
     ranking: SEARCH_RANKING_NOTE,
-    candidates_ranked: candidates.size,
-    congresses_searched: congressesSearched,
-    bills: top.map(({ b, m }) => ({ ...formatBill(b), match: m.tier, matched_title: m.matched_title })),
+    candidates_ranked: best.size,
+    bills: detailed,
   };
 }
 
-async function getRecentBills(by: string, congress: number | undefined, limit: number) {
+async function getRecentBills(args: Record<string, unknown>) {
+  const apiKey = requireApiKey(args);
+  const by = typeof args.by === 'string' ? args.by : 'introduced';
+  const congress = typeof args.congress === 'number' ? args.congress : undefined;
+  const limit = typeof args.limit === 'number' ? args.limit : 20;
   const count = Math.min(Math.max(1, limit), 100);
-  const orderBy = by === 'activity' ? '-current_status_date' : '-introduced_date';
-  const params = new URLSearchParams({ limit: String(count), order_by: orderBy });
-  if (congress != null) params.set('congress', String(congress));
+  // `sort=updateDate+desc` is verified live (fleet #3164, 2026-10-16: 200 OK,
+  // pagination.count 19,696 for congress 119). `sort=introducedDate+desc`
+  // follows the same documented asc/desc convention (LOC's BillEndpoint.md
+  // names `introducedDate` as a sort field) but was NOT independently
+  // live-verified — DEMO_KEY's 10/hr quota was exhausted first. If this ever
+  // 400s, that is the field to check first.
+  const sort = by === 'activity' ? 'updateDate+desc' : 'introducedDate+desc';
+  const path = congress != null ? `/bill/${congress}` : '/bill';
 
-  const res = await pwFetch(`${BASE_URL}/bill?${params}`);
-  if (!res.ok) throw await httpError(res, 'GovTrack API error');
-
-  const data = (await res.json()) as GovTrackListResponse<RawBill>;
+  const data = await congressGovFetch<CongressGovListResponse<RawCongressBill>>(
+    path,
+    { limit: count, sort },
+    apiKey,
+  );
+  const bills = data.bills ?? [];
 
   return {
-    sort_by: by === 'activity' ? 'latest_action' : 'introduced_date',
+    sort_by: by === 'activity' ? 'latest_update' : 'introduced_date',
     congress: congress ?? null,
-    total: data.meta?.total_count ?? data.objects.length,
-    returned: data.objects.length,
-    bills: data.objects.map(formatBill),
+    total: data.pagination?.count ?? bills.length,
+    returned: bills.length,
+    bills: bills.map(formatCongressBill),
   };
 }
 
 /**
- * GovTrack bill types, plus the short forms every caller actually types.
+ * congress.gov bill types (lowercase path segments), plus the long GovTrack-era
+ * forms and the short forms every caller actually types, so this migration does
+ * not break an existing caller's `bill_type` value.
  *
- * `hr` is what a person writes and `house_bill` is what the API wants; a caller
- * who sends the former gets a silent zero-result list, which is the worse of the
- * two failures because it reads as "no such bill".
+ * `hr` is what a person writes; congress.gov's path segment is also `hr`, so
+ * this is now mostly a no-op for the short forms — but a caller who sends the
+ * long `house_bill` form (what this pack asked for before this migration)
+ * still needs to land on the right congress.gov segment, and a caller who
+ * sends a bad value should get a named error, not a silent zero-result list.
  */
 const BILL_TYPE_ALIASES: Record<string, string> = {
-  hr: 'house_bill',
-  'h.r.': 'house_bill',
-  'h.r': 'house_bill',
-  house_bill: 'house_bill',
-  s: 'senate_bill',
-  'senate bill': 'senate_bill',
-  senate_bill: 'senate_bill',
-  hres: 'house_resolution',
-  house_resolution: 'house_resolution',
-  sres: 'senate_resolution',
-  senate_resolution: 'senate_resolution',
-  hjres: 'house_joint_resolution',
-  house_joint_resolution: 'house_joint_resolution',
-  sjres: 'senate_joint_resolution',
-  senate_joint_resolution: 'senate_joint_resolution',
-  hconres: 'house_concurrent_resolution',
-  house_concurrent_resolution: 'house_concurrent_resolution',
-  sconres: 'senate_concurrent_resolution',
-  senate_concurrent_resolution: 'senate_concurrent_resolution',
+  hr: 'hr',
+  'h.r.': 'hr',
+  'h.r': 'hr',
+  house_bill: 'hr',
+  s: 's',
+  'senate bill': 's',
+  senate_bill: 's',
+  hres: 'hres',
+  house_resolution: 'hres',
+  sres: 'sres',
+  senate_resolution: 'sres',
+  hjres: 'hjres',
+  house_joint_resolution: 'hjres',
+  sjres: 'sjres',
+  senate_joint_resolution: 'sjres',
+  hconres: 'hconres',
+  house_concurrent_resolution: 'hconres',
+  sconres: 'sconres',
+  senate_concurrent_resolution: 'sconres',
+};
+
+const BILL_TYPE_LABELS: Record<string, string> = {
+  hr: 'House Bill',
+  s: 'Senate Bill',
+  hres: 'House Resolution',
+  sres: 'Senate Resolution',
+  hjres: 'House Joint Resolution',
+  sjres: 'Senate Joint Resolution',
+  hconres: 'House Concurrent Resolution',
+  sconres: 'Senate Concurrent Resolution',
 };
 
 /**
- * Bills are addressed by congress + type + number, not by an internal id.
+ * Bills are addressed by congress + type + number — congress.gov's own path
+ * shape, e.g. /v3/bill/118/hr/1 for H.R. 1 of the 118th Congress.
  *
- * This tool used to require `id`, a GovTrack-internal numeric key, and that
- * made it UNCALLABLE rather than merely awkward: GovTrack v2 does not return
- * `id` on any endpoint any more — not on /bill, not with an explicit
- * `fields=id` — so `search_bills` emits nothing for it either (its formatter's
- * `id: b.id` has been `undefined`, and therefore absent from the JSON, for as
- * long as that has been true). There was no path through this pack, or any
- * other, by which a caller could obtain the one argument the tool demanded.
- *
- * Measured 2026-09-16: a REGISTERED account called it three times in a week and
- * got three `400 id is required`. I reached for congress/bill_type/number
- * myself before reading the schema, which is the same mistake from a different
- * direction and is the reason this is a defect rather than a documentation gap —
- * the natural key is what everyone reaches for because it is how bills are
- * identified in the world.
- *
- * `id` is still accepted so nothing that somehow had one breaks.
+ * `id`, a GovTrack-internal numeric key this tool used to also accept, is
+ * dropped: congress.gov has no such id and never did, so there is nothing to
+ * look it up against now that GovTrack is gone (fleet #3164).
  */
 async function getBill(args: Record<string, unknown>) {
-  if (typeof args.id === 'number' && Number.isFinite(args.id)) {
-    const res = await pwFetch(`${BASE_URL}/bill/${args.id}`);
-    if (!res.ok) throw await httpError(res, 'GovTrack API error');
-    return formatBill((await res.json()) as RawBill);
-  }
-
+  const apiKey = requireApiKey(args);
   const congress = typeof args.congress === 'number' ? Math.floor(args.congress) : NaN;
   const number = typeof args.number === 'number' ? Math.floor(args.number) : NaN;
   const rawType = typeof args.bill_type === 'string' ? args.bill_type.trim().toLowerCase() : '';
@@ -1575,65 +1559,126 @@ async function getBill(args: Record<string, unknown>) {
     };
   }
 
-  const params = new URLSearchParams({
-    congress: String(congress),
-    bill_type: billType,
-    number: String(number),
-  });
-  const res = await pwFetch(`${BASE_URL}/bill?${params}`);
-  if (!res.ok) throw await httpError(res, 'GovTrack API error');
-
-  const data = (await res.json()) as GovTrackListResponse<RawBill>;
-  const bill = Array.isArray(data.objects) ? data.objects[0] : undefined;
-  if (!bill) {
+  const res = await pwFetch(congressGovUrl(`/bill/${congress}/${billType}/${number}`, {}, apiKey));
+  if (res.status === 404) {
     // Say which of the two it is. A caller cannot act on "not found" without
-    // knowing whether the bill is absent or the congress is out of range.
+    // knowing whether the bill is absent or the congress/number is out of range.
     return {
       found: false,
-      error: `No bill matching congress ${congress}, ${billType}, number ${number}. GovTrack covers the 93rd Congress onward, so check the congress number as well as the bill number.`,
+      error: `No bill matching congress ${congress}, ${billType}, number ${number} on congress.gov. Check the congress and bill number.`,
       congress,
       bill_type: billType,
       number,
     };
   }
-  return formatBill(bill);
+  if (!res.ok) throw await httpError(res, 'congress.gov API error');
+  const data = await parseJson<{ bill: RawCongressBill }>(res, 'congress.gov');
+  return formatCongressBill(data.bill);
 }
 
-async function getMembers(limit: number) {
+async function getMembers(args: Record<string, unknown>) {
+  const apiKey = requireApiKey(args);
+  const limit = typeof args.limit === 'number' ? args.limit : 50;
   const count = Math.min(Math.max(1, limit), 600);
-  const params = new URLSearchParams({
-    current: 'true',
-    limit: String(count),
-  });
 
-  const res = await pwFetch(`${BASE_URL}/role?${params}`);
-  if (!res.ok) throw await httpError(res, 'GovTrack API error');
-
-  const data = (await res.json()) as GovTrackListResponse<RawMemberRole>;
+  const data = await congressGovFetch<CongressGovListResponse<RawCongressMember>>(
+    '/member',
+    { currentMember: 'true', limit: count },
+    apiKey,
+  );
+  const members = data.members ?? [];
 
   return {
-    total: data.meta?.total_count ?? data.objects.length,
-    returned: data.objects.length,
-    members: data.objects.map(formatMember),
+    total: data.pagination?.count ?? members.length,
+    returned: members.length,
+    members: members.map(formatCongressMember),
   };
 }
 
-async function getVotes(limit: number, congress?: number) {
+/**
+ * NOT MIGRATED (fleet #3164): GovTrack's /vote endpoint is Cloudflare-blocked
+ * like every other endpoint on that host, but congress.gov's official API has
+ * no roll-call-vote endpoint that covers BOTH chambers — only a House-only
+ * one (HouseRollCallVoteEndpoint). Returning House votes alone under a tool
+ * named `get_votes` would silently drop every Senate vote behind a clean
+ * 200 — a worse failure than today's loud one, and the shape
+ * docs/silent-zero-policy.md exists to rule out. Fails immediately with no
+ * network call (GovTrack is reliably dead; there is nothing to gain by
+ * actually hitting it) so this is fast and honest rather than a guaranteed
+ * timeout-shaped 403. Left as a known gap for a follow-up task.
+ */
+function getVotes(): never {
+  throw new Error(
+    'congress get_votes: not available. GovTrack (the only source this tool ever used) now answers every ' +
+      'endpoint with a Cloudflare bot-challenge (HTTP 403), and congress.gov\'s official API has no roll-call-vote ' +
+      'endpoint covering both the House and the Senate (only a House-only one), so there is no complete official ' +
+      'replacement yet. This is a known gap, not a transient fault — retrying will not help.',
+  );
+}
+
+type RawLaw = {
+  congress?: number | null;
+  type?: string | null;
+  number?: string | null;
+  title?: string | null;
+  originChamber?: string | null;
+  latestAction?: { actionDate?: string | null; text?: string | null } | null;
+  laws?: Array<{ number?: string | null; type?: string | null }> | null;
+};
+
+/**
+ * NEW capability (fleet #3164) — GovTrack never had a laws endpoint at all,
+ * so this is not a migration of an existing tool. congress.gov's own /law
+ * endpoint: /law/{congress} (public + private), /law/{congress}/pub,
+ * /law/{congress}/priv. Verified live (DEMO_KEY): 119th Congress has 121
+ * public laws + 2 private = 123 total; the most recent public law is PL
+ * 119-121 (S.195, "Became Public Law No: 119-121" on 2026-10-09).
+ */
+async function getPublicLaws(args: Record<string, unknown>) {
+  const apiKey = requireApiKey(args);
+  const congress = typeof args.congress === 'number' ? Math.floor(args.congress) : NaN;
+  if (!Number.isFinite(congress)) {
+    return { error: 'Pass `congress` — the Congress number, e.g. 119 for the 119th Congress (2025–2026).' };
+  }
+  const lawTypeArg = typeof args.law_type === 'string' ? args.law_type.trim().toLowerCase() : 'pub';
+  const lawType = lawTypeArg === 'priv' || lawTypeArg === 'private' ? 'priv' : 'pub';
+  const limit = typeof args.limit === 'number' ? args.limit : 20;
   const count = Math.min(Math.max(1, limit), 100);
-  // Without explicit ordering GovTrack returns votes oldest-first (back to 1789),
-  // which contradicts this tool's purpose ("recent votes"). Sort newest-first.
-  const params = new URLSearchParams({ limit: String(count), order_by: '-created' });
-  if (congress != null) params.set('congress', String(congress));
 
-  const res = await pwFetch(`${BASE_URL}/vote?${params}`);
-  if (!res.ok) throw await httpError(res, 'GovTrack API error');
-
-  const data = (await res.json()) as GovTrackListResponse<RawVote>;
+  // No `sort` param here — verified live (DEMO_KEY, 2026-10-16) that /law's
+  // default order is already most-recent-law-first (119/pub's first row was
+  // PL 119-121, enacted 2026-10-09, the newest at the time), and `sort` on
+  // this endpoint is unverified (DEMO_KEY's 10/hr quota was exhausted before
+  // it could be checked) — safer to rely on the observed default than guess.
+  const data = await congressGovFetch<CongressGovListResponse<RawLaw>>(
+    `/law/${congress}/${lawType}`,
+    { limit: count },
+    apiKey,
+  );
+  const laws = data.bills ?? [];
 
   return {
-    total: data.meta?.total_count ?? data.objects.length,
-    returned: data.objects.length,
-    votes: data.objects.map(formatVote),
+    congress,
+    law_type: lawType === 'pub' ? 'public' : 'private',
+    total: data.pagination?.count ?? laws.length,
+    returned: laws.length,
+    most_recent: laws[0]
+      ? {
+          law_number: laws[0].laws?.[0]?.number ?? null,
+          bill: `${(laws[0].type ?? '').toUpperCase()} ${laws[0].number ?? ''}`.trim(),
+          title: laws[0].title ?? null,
+          became_law_date: laws[0].latestAction?.actionDate ?? null,
+        }
+      : null,
+    laws: laws.map((l) => ({
+      law_number: l.laws?.[0]?.number ?? null,
+      congress: l.congress ?? congress,
+      bill_type: (l.type ?? '').toLowerCase() || null,
+      bill_number: l.number != null ? Number(l.number) : null,
+      title: l.title ?? null,
+      origin_chamber: l.originChamber ?? null,
+      became_law_date: l.latestAction?.actionDate ?? null,
+    })),
   };
 }
 
