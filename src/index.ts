@@ -1363,7 +1363,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'get_votes',
     description:
-      'ANSWERS "how did the Senate vote on X" / "recent House roll calls" / "cloture vote tally" — recent roll-call votes for ONE chamber, newest first within that chamber + session. House votes come from the Clerk of the House\'s own records (via congress.gov\'s official API); Senate votes come from the Secretary of the Senate\'s own published roll-call vote records (public, no credentials). Pass chamber: "house" or "senate" — the two chambers number their votes independently, so there is no combined listing. Returns question, result, yes/no tallies and date for each vote; every response names its own chamber, congress, session and source. Pass congress + session to look at a specific past session (session can only be left out for the CURRENT Congress); omit both for the current session. A chamber/congress/session nothing has been published for returns a named reason, never a silent empty list.',
+      'ANSWERS "how did the Senate vote on X" / "recent House roll calls" / "cloture vote tally" — recent roll-call votes for ONE chamber, newest first within that chamber + session. House votes come from the Clerk of the House\'s own records (via congress.gov\'s official API), addressed directly by roll-call number (House roll numbers are sequential 1..N within a session) — so this is capped at 25 per call for House, since each House vote costs its own upstream request; a higher `limit` is silently clamped with a note, not an error. Senate votes come from the Secretary of the Senate\'s own published roll-call vote records (public, no credentials) and are not capped this way. Pass chamber: "house" or "senate" — the two chambers number their votes independently, so there is no combined listing. Returns question, result, yes/no tallies and date for each vote; every response names its own chamber, congress, session and source. Pass congress + session to look at a specific past session (session can only be left out for the CURRENT Congress); omit both for the current session. A chamber/congress/session nothing has been published for returns a named reason, never a silent empty list. A House roll number that congress.gov has no record of (e.g. vacated and never reused) is skipped and named in `note`, not silently missing.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1884,8 +1884,13 @@ function formatHouseVote(v: RawHouseVote): Record<string, unknown> {
     yes_votes: totals?.yea ?? null,
     no_votes: totals?.nay ?? null,
     present_votes: totals?.present ?? null,
+    // `other_votes` (present + not_voting) was DROPPED here (fleet #3215):
+    // every live sample had present_votes 0, so it was reading identical to
+    // not_voting on every real call — a second field name for the same
+    // number reads as two different signals when it never was. present_votes
+    // and not_voting above are congress.gov's own breakdown; a caller who
+    // wants "everyone who wasn't a yes or no" sums them.
     not_voting: totals?.notVoting ?? null,
-    other_votes: totals ? totals.present + totals.notVoting : null,
     related_bill: v.legislationType && v.legislationNumber ? `${v.legislationType} ${v.legislationNumber}` : null,
     link: v.legislationUrl ?? null,
   };
@@ -1910,55 +1915,113 @@ function formatHouseVote(v: RawHouseVote): Record<string, unknown> {
  * called with a fallback to the raw object if that key is absent, so a wrong
  * guess degrades to missing question/totals rather than throwing.
  */
+/** Every House vote request this pack ever makes costs its own upstream round-trip (see getHouseVotes) -- capped so one get_votes call cannot fan out unboundedly. */
+const HOUSE_VOTE_FETCH_CAP = 25;
+
+/**
+ * fleet #3215, part 3 -- parts 1 and 2 fixed `total` and then "fetch the
+ * newest page instead of page 0", but the LIST endpoint (at any offset)
+ * still has internal jitter and can have HOLES: live, post-#3215-part-2,
+ * `limit:10` for a 314-vote session returned 314..307 then jumped straight
+ * to 304, 303 -- rolls 306 and 305 were simply absent from whichever page
+ * congress.gov returned, a plausible-looking list with gaps in it.
+ *
+ * House roll-call numbers are sequential 1..`pagination.count` WITHIN a
+ * session (congress.gov's own convention), so the list is not needed to
+ * find the votes at all -- only to learn the session's count. Once that is
+ * known, the newest N votes are addressed DIRECTLY and deterministically:
+ * roll = count, count-1, ..., count-N+1, each fetched from the single-vote
+ * detail endpoint (which this pack already calls for every vote's
+ * question/totals) rather than from the list. No list page, no jitter, no
+ * holes.
+ *
+ * A roll number that 404s (e.g. one was vacated/stricken and never
+ * reused) is skipped and named in `note` -- never silently dropped, and
+ * never treated as a reason to throw, since a per-vote 404 says something
+ * concrete about that ONE roll call, not about the request as a whole. Any
+ * OTHER failure (5xx, network, auth) is NOT swallowed this way -- it
+ * propagates loud, because that is a fault in the call, not a fact about
+ * one roll number.
+ */
 async function getHouseVotes(args: Record<string, unknown>, congress: number, session: number, count: number) {
   const apiKey = requireApiKey(args);
-  const fetchLimit = Math.min(250, Math.max(count * 3, 50));
-  const list = await congressGovFetch<{ houseRollCallVotes?: RawHouseVote[] }>(
+  const cappedCount = Math.min(count, HOUSE_VOTE_FETCH_CAP);
+
+  // The list is used ONLY to learn `pagination.count` -- `limit: 1` keeps
+  // this cheap; verified live, 2026-10-16/17, that the count is the same
+  // regardless of `limit`.
+  const probe = await congressGovFetch<{ pagination?: { count?: number | null } | null }>(
     `/house-vote/${congress}/${session}`,
-    { limit: fetchLimit },
+    { limit: 1 },
     apiKey,
   );
-  const raw = list.houseRollCallVotes ?? [];
-  if (raw.length === 0) {
+  const sessionTotal = probe.pagination?.count ?? null;
+  if (sessionTotal == null) {
     return {
       found: false,
       chamber: 'house',
       source: HOUSE_VOTE_SOURCE,
       error:
-        `No House roll-call votes found for congress ${congress}, session ${session} on congress.gov. ` +
-        'That session may not have started yet, may genuinely have recorded none so far, or may be outside this source\'s coverage.',
+        `congress.gov did not report a roll-call count for congress ${congress}, session ${session}, so individual votes ` +
+        'cannot be addressed by number. That session may not have started yet or may be outside this source\'s coverage.',
       congress,
       session,
     };
   }
-  const top = [...raw].sort((a, b) => (b.startDate ?? '').localeCompare(a.startDate ?? '')).slice(0, count);
-  const detailed = await Promise.all(
-    top.map(async (v) => {
+  if (sessionTotal === 0) {
+    return {
+      found: false,
+      chamber: 'house',
+      source: HOUSE_VOTE_SOURCE,
+      error: `No House roll-call votes recorded yet for congress ${congress}, session ${session}.`,
+      congress,
+      session,
+    };
+  }
+
+  const rollNumbers: number[] = [];
+  for (let n = sessionTotal; n >= 1 && rollNumbers.length < cappedCount; n--) rollNumbers.push(n);
+
+  const skipped: number[] = [];
+  const results = await Promise.all(
+    rollNumbers.map(async (n): Promise<Record<string, unknown> | null> => {
       try {
-        const detail = await congressGovFetch<Record<string, unknown>>(
-          `/house-vote/${v.congress}/${v.sessionNumber}/${v.rollCallNumber}`,
-          {},
-          apiKey,
-        );
+        const detail = await congressGovFetch<Record<string, unknown>>(`/house-vote/${congress}/${session}/${n}`, {}, apiKey);
         const inner = (detail.houseRollCallVote as RawHouseVote | undefined) ?? (detail as RawHouseVote);
         return formatHouseVote(inner);
-      } catch {
-        // The per-vote detail fetch failed (rare — e.g. a transient 5xx) —
-        // still report the vote from the list row rather than dropping it
-        // silently; it will be missing question/totals, which is visibly
-        // different from a vote that never existed.
-        return { ...formatHouseVote(v), detail_fetch_failed: true };
+      } catch (err) {
+        if (err instanceof Error && /\b404\b/.test(err.message)) {
+          skipped.push(n);
+          return null;
+        }
+        throw err; // a real fault (5xx/network/auth) -- not this roll's business, do not mask it as a skip
       }
     }),
   );
+  // Preserve the newest-first order even though some may have been skipped.
+  const votes = results.filter((v): v is Record<string, unknown> => v !== null);
+
+  const notes: string[] = [];
+  if (count > HOUSE_VOTE_FETCH_CAP) {
+    notes.push(
+      `limit was capped at ${HOUSE_VOTE_FETCH_CAP} -- each House vote costs its own upstream request to congress.gov, so one call is bounded.`,
+    );
+  }
+  if (skipped.length > 0) {
+    notes.push(
+      `Roll call(s) ${skipped.join(', ')} could not be read from congress.gov (likely vacated/stricken and never reused) and are skipped, not silently absent.`,
+    );
+  }
+
   return {
     chamber: 'house',
     source: HOUSE_VOTE_SOURCE,
     congress,
     session,
-    total: raw.length,
-    returned: detailed.length,
-    votes: detailed,
+    total: sessionTotal,
+    returned: votes.length,
+    ...(notes.length > 0 ? { note: notes.join(' ') } : {}),
+    votes,
   };
 }
 

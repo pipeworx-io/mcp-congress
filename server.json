@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/congress",
   "title": "Congress",
   "description": "Congress MCP — US Congress bill/law/member data via the official congress.gov API (Library of…",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "websiteUrl": "https://pipeworx.io/packs/congress",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-congress",

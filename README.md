@@ -54,6 +54,10 @@ Every response names its own `chamber`, `congress`, `session` and `source`. Omit
 
 An "en bloc" Senate vote (several nominees confirmed together, e.g. under a standing order) has no single `question`/`issue` of its own — `question` becomes "En bloc confirmation of N matters" and `en_bloc_matter_count` carries the count, rather than silently reporting one nominee's own question as if it were the whole vote's.
 
+`total` (House) is congress.gov's own session vote count (`pagination.count`), the same at any `limit` — the House list endpoint carries no sort and this pack fetches/re-ranks only enough rows to satisfy `limit`, so `total` is read from the API's own count, never backfilled from however many rows this one call happened to fetch (fleet #3215). If congress.gov ever omits that count, `total` is left out entirely with a `note`, rather than silently reporting the fetched-row count as the real total. `other_votes` was dropped from House vote records (fleet #3215) — it was a sum of `present_votes` + `not_voting` that, on every observed live vote, read identically to `not_voting` alone (present votes are rare); sum the two yourself if you want that figure.
+
+House votes are NOT read from the list endpoint at all, at any offset — confirmed live, 2026-10-17: even a page fetched from the TAIL of the list (an earlier attempt at this fix) can have holes (one real session's `limit:10` came back `314..307, 304, 303` — rolls 306 and 305 were simply missing from that page). House roll-call numbers are sequential 1..`pagination.count` within a session, so the newest votes are addressed DIRECTLY by number (`count`, `count-1`, ...) via the single-vote detail endpoint — no list page, no jitter, no holes. This is capped at **25 per call** for House (each vote costs its own upstream request); a higher `limit` is clamped with a note. A roll number congress.gov has no record of (vacated/stricken and never reused) is skipped and named in `note` — `total` itself is unaffected, since it already comes from `pagination.count`, not from counting what was successfully fetched.
+
 ## Congress numbering
 
 Congresses are numbered sequentially: 119th Congress = 2025-2027 (started Jan 2025), 118th = 2023-2025, etc. Bills carry their Congress number — `HR1` of the 119th is a different bill than `HR1` of the 118th.
@@ -132,12 +136,12 @@ reaches all of them from either one.
 ## No MCP client? Call it over HTTP
 
 ```bash
-curl -X POST https://gateway.pipeworx.io/v1/tools/search_bills \
+curl -X POST https://gateway.pipeworx.io/v1/tools/congress_search_bills \
   -H 'Content-Type: application/json' \
   -d '{"query":"Lower Energy Costs Act","limit":10}'
 ```
 
-No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/search_bills`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
+No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/congress_search_bills`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
 
 ## Standalone (no gateway account)
 
