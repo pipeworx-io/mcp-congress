@@ -732,6 +732,7 @@ function collapse(s: string): string {
 
 import type {
   CommitteeRow,
+  CommitteeSubcommitteeRow,
   CommitteeMemberRow,
   MemberCommitteeAssignment,
   MemberProfile,
@@ -749,6 +750,22 @@ async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response>
 const CONGRESS_GOV_BASE = 'https://api.congress.gov/v3';
 // --- GovInfo (GPO), used ONLY for search_bills's full-text keyword search ---
 const GOVINFO_SEARCH_URL = 'https://api.govinfo.gov/search';
+// --- Senate.gov (official, public, keyless) — used ONLY for get_votes's Senate side ---
+const SENATE_VOTE_MENU_BASE = 'https://www.senate.gov/legislative/LIS/roll_call_lists';
+
+// Workers have no DOMParser; this XML is small and flat/regular (same
+// approach as mcps/faa-delays, mcps/edgar's Form 4 parsing).
+function xmlTag(block: string, name: string): string | null {
+  const m = new RegExp(`<${name}>([\\s\\S]*?)</${name}>`, 'i').exec(block);
+  return m ? m[1].trim() : null;
+}
+function xmlBlocks(xml: string, name: string): string[] {
+  const out: string[] = [];
+  const re = new RegExp(`<${name}>([\\s\\S]*?)</${name}>`, 'gi');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) out.push(m[1]);
+  return out;
+}
 
 const API_KEY_HINT =
   'Pass a free api.data.gov key as `_apiKey` (https://api.data.gov/signup/) — the same key ' +
@@ -985,15 +1002,101 @@ function normalizeCommitteeName(s: string): string[] {
     .filter((w) => w && !COMMITTEE_NAME_STOPWORDS.has(w));
 }
 
-/** Full-committee (not subcommittee) name search — every query word must appear in (or be a prefix/suffix of) a candidate word. */
-function findCommitteesByName(name: string, chamber: string | undefined): CommitteeRow[] {
+type NameMatchTier = 'exact' | 'all_words' | 'none';
+const TIER_RANK: Record<NameMatchTier, number> = { exact: 0, all_words: 1, none: 2 };
+
+/**
+ * Word-token match: every query word must appear in (or be a prefix/suffix
+ * of) a candidate word — 'exact' when that coverage is mutual (same word
+ * COUNT, every candidate word also matched by some query word), 'all_words'
+ * when the query is fully covered but the candidate has extra words (or vice
+ * versa isn't checked — covered is query-into-candidate only).
+ */
+function nameMatchTier(qWords: string[], cWords: string[]): NameMatchTier {
+  if (qWords.length === 0 || cWords.length === 0) return 'none';
+  const matches = (a: string, b: string) => a === b || a.startsWith(b) || b.startsWith(a);
+  const covered = qWords.every((w) => cWords.some((cw) => matches(cw, w)));
+  if (!covered) return 'none';
+  if (qWords.length !== cWords.length) return 'all_words';
+  const reverseCovered = cWords.every((w) => qWords.some((qw) => matches(qw, w)));
+  return reverseCovered ? 'exact' : 'all_words';
+}
+
+type CommitteeCandidate =
+  | { kind: 'committee'; committee: CommitteeRow; tier: NameMatchTier }
+  | { kind: 'subcommittee'; committee: CommitteeRow; sub: CommitteeSubcommitteeRow; tier: NameMatchTier };
+
+/**
+ * Word-token name search over BOTH committees and their subcommittees
+ * (fleet #3203) — this used to look only at the ~230 top-level committee
+ * names, so "Cybersecurity" (Senate Armed Services' Subcommittee on
+ * Cybersecurity, SSAS21) came back `found: false` even though the data has
+ * it, and a caller that then asked for "the chair" got the FULL committee's
+ * chair (Wicker) — a wrong answer wearing a clean response, not a crash.
+ *
+ * Each subcommittee is scored against TWO strings and the BETTER tier is
+ * kept: its own bare name ("Cybersecurity"), and its full name combined with
+ * its parent committee's ("Senate Committee on Armed Services Subcommittee
+ * on Cybersecurity"). The combined form lets a caller who names BOTH the
+ * committee and the subcommittee ("Senate Armed Services Subcommittee on
+ * Cybersecurity") land on the one subcommittee whose PARENT is also Armed
+ * Services, rather than a same-named subcommittee under a different
+ * committee (House Armed Services has a Cyber-named subcommittee too).
+ *
+ * Exact-first ranking (same shape as fleet #3169/#3193): a name that is
+ * EXACTLY the subcommittee's own name ("Cybersecurity" == "Cybersecurity")
+ * ranks above one that merely contains every query word among extra words
+ * ("Cybersecurity, Information Technology, and Government Innovation" also
+ * contains "cybersecurity") — so one unambiguous exact match wins outright
+ * even when several looser matches exist, and those looser ones are
+ * returned as `alternatives` rather than silently dropped or forcing an
+ * `ambiguous` branch they do not belong in.
+ */
+function findCommitteeCandidates(name: string, chamber: string | undefined): CommitteeCandidate[] {
   const qWords = normalizeCommitteeName(name);
   if (qWords.length === 0) return [];
-  return COMMITTEES.filter((c) => {
-    if (chamber && c.chamber !== chamber) return false;
-    const cWords = normalizeCommitteeName(c.name);
-    return qWords.every((w) => cWords.some((cw) => cw === w || cw.startsWith(w) || w.startsWith(cw)));
-  });
+  const out: CommitteeCandidate[] = [];
+  for (const c of COMMITTEES) {
+    if (chamber && c.chamber !== chamber) continue;
+    const parentWords = normalizeCommitteeName(c.name);
+    const committeeTier = nameMatchTier(qWords, parentWords);
+    if (committeeTier !== 'none') out.push({ kind: 'committee', committee: c, tier: committeeTier });
+    // The combined (parent + sub) form is only useful when the query has
+    // content the PARENT's own name does not already explain — otherwise
+    // every one of a matched committee's subcommittees would inherit the
+    // same coverage via the parent's words baked into the combined string,
+    // producing a false tie between the committee and ALL of its
+    // subcommittees for a query that only ever named the committee (e.g.
+    // "Ways" matching House Ways and Means all_words-ties every one of its
+    // 6 subcommittees too, since "Ways and Means Subcommittee on X" still
+    // contains "ways"). Skipping the combined form here, not the bare one,
+    // is what lets a bare committee-level query resolve to the committee
+    // alone.
+    const parentCoversQuery = qWords.every((w) => parentWords.some((pw) => pw === w || pw.startsWith(w) || w.startsWith(pw)));
+    for (const sub of c.subcommittees) {
+      const bareTier = nameMatchTier(qWords, normalizeCommitteeName(sub.name));
+      const combinedTier = parentCoversQuery
+        ? 'none'
+        : nameMatchTier(qWords, normalizeCommitteeName(`${c.name} Subcommittee on ${sub.name}`));
+      const tier = TIER_RANK[bareTier] <= TIER_RANK[combinedTier] ? bareTier : combinedTier;
+      if (tier !== 'none') out.push({ kind: 'subcommittee', committee: c, sub, tier });
+    }
+  }
+  return out.sort((a, b) => TIER_RANK[a.tier] - TIER_RANK[b.tier]);
+}
+
+/** A short, labelled summary of a candidate for `alternatives`/`matches` arrays — never the full roster, so disclosing an alternative does not cost another full payload. */
+function candidateSummary(cand: CommitteeCandidate): Record<string, unknown> {
+  if (cand.kind === 'committee') {
+    return { kind: 'committee', id: cand.committee.id, name: cand.committee.name, chamber: cand.committee.chamber };
+  }
+  return {
+    kind: 'subcommittee',
+    id: cand.sub.id,
+    name: `${cand.committee.name} Subcommittee on ${cand.sub.name}`,
+    chamber: cand.committee.chamber,
+    parent_committee_id: cand.committee.id,
+  };
 }
 
 function findCommitteeById(id: string): CommitteeRow | undefined {
@@ -1016,6 +1119,33 @@ function buildFullCommittee(c: CommitteeRow) {
     member_count: members.length,
     members,
     subcommittees: c.subcommittees,
+  };
+}
+
+/**
+ * The subcommittee's OWN chair/ranking member, resolved from ITS OWN
+ * membership roster (`COMMITTEE_MEMBERSHIP[sub.id]`) — never the parent
+ * committee's. `parent_committee_id`/`parent_committee_name` name the parent
+ * as separate fields so nothing downstream can mistake one for the other
+ * (fleet #3203 — this was the bug: a caller who could not find the
+ * subcommittee by name fell back to the FULL committee and its chair, which
+ * `buildFullCommittee` never claims to be a subcommittee, but a name search
+ * that returned the parent silently, under a question shaped like a
+ * subcommittee lookup, let the wrong attribution happen one level up).
+ */
+function buildSubcommittee(c: CommitteeRow, sub: CommitteeSubcommitteeRow) {
+  const members = COMMITTEE_MEMBERSHIP[sub.id] ?? [];
+  const { chair, ranking_member } = resolveLeadership(members);
+  return {
+    id: sub.id,
+    name: `${c.name} Subcommittee on ${sub.name}`,
+    chamber: c.chamber,
+    parent_committee_id: c.id,
+    parent_committee_name: c.name,
+    chair,
+    ranking_member,
+    member_count: members.length,
+    members,
   };
 }
 
@@ -1065,22 +1195,7 @@ function committeeMembers(args: Record<string, unknown>) {
     if (top) return { data_as_of: CONGRESS_DATA_AS_OF, ...buildFullCommittee(top) };
     for (const c of COMMITTEES) {
       const sub = c.subcommittees.find((s) => s.id.toUpperCase() === idArg.toUpperCase());
-      if (sub) {
-        const members = COMMITTEE_MEMBERSHIP[sub.id] ?? [];
-        const { chair, ranking_member } = resolveLeadership(members);
-        return {
-          data_as_of: CONGRESS_DATA_AS_OF,
-          id: sub.id,
-          name: `${c.name} Subcommittee on ${sub.name}`,
-          chamber: c.chamber,
-          parent_committee_id: c.id,
-          parent_committee_name: c.name,
-          chair,
-          ranking_member,
-          member_count: members.length,
-          members,
-        };
-      }
+      if (sub) return { data_as_of: CONGRESS_DATA_AS_OF, ...buildSubcommittee(c, sub) };
     }
     return {
       found: false,
@@ -1089,22 +1204,70 @@ function committeeMembers(args: Record<string, unknown>) {
     };
   }
 
-  const matches = findCommitteesByName(nameArg!, chamberArg);
-  if (matches.length === 0) {
+  // Name search over BOTH committees and subcommittees, exact-first ranked
+  // (fleet #3203 — see findCommitteeCandidates).
+  const candidates = findCommitteeCandidates(nameArg!, chamberArg);
+  if (candidates.length === 0) {
     return {
       found: false,
-      error: `No committee name matched "${nameArg}"${chamberArg ? ` in the ${chamberArg}` : ''}. Try a shorter name (e.g. "Appropriations", "Judiciary", "Ways and Means"), or pass chamber to disambiguate.`,
+      error: `No committee or subcommittee name matched "${nameArg}"${chamberArg ? ` in the ${chamberArg}` : ''}. Try a shorter name (e.g. "Appropriations", "Judiciary", "Ways and Means"), or pass chamber to disambiguate.`,
       name: nameArg,
     };
   }
-  if (matches.length === 1) {
-    return { data_as_of: CONGRESS_DATA_AS_OF, ...buildFullCommittee(matches[0]) };
+
+  const topTier = candidates[0].tier;
+  const top = candidates.filter((cand) => cand.tier === topTier);
+  const rest = candidates.filter((cand) => cand.tier !== topTier);
+
+  if (top.length > 1) {
+    // True ambiguity — more than one committee/subcommittee is an equally
+    // good match (e.g. bare "Appropriations" names both chambers' committee
+    // exactly). Return every tied candidate's FULL record, same shape as
+    // before this fix, now drawn from the unified committee+subcommittee pool.
+    return {
+      data_as_of: CONGRESS_DATA_AS_OF,
+      ambiguous: true,
+      note:
+        `"${nameArg}" matched ${top.length} committees/subcommittees equally well` +
+        (topTier === 'exact' ? ' (all by an exact name match)' : '') +
+        ' — pass chamber, or call again by committee_id, to pick one.',
+      matches: top.map((cand) =>
+        cand.kind === 'committee'
+          ? { data_as_of: CONGRESS_DATA_AS_OF, ...buildFullCommittee(cand.committee) }
+          : { data_as_of: CONGRESS_DATA_AS_OF, ...buildSubcommittee(cand.committee, cand.sub) },
+      ),
+    };
   }
+
+  const winner = top[0];
+  const record =
+    winner.kind === 'committee'
+      ? { data_as_of: CONGRESS_DATA_AS_OF, ...buildFullCommittee(winner.committee) }
+      : { data_as_of: CONGRESS_DATA_AS_OF, ...buildSubcommittee(winner.committee, winner.sub) };
+
+  // "A name that matches only a parent must say so" (fleet #3203): the
+  // winner is the PARENT committee itself, but the query had word(s) its own
+  // name doesn't cover (tier all_words, not exact) — the caller likely meant
+  // a more specific subcommittee that does not exist under that name. Say so
+  // explicitly rather than silently handing back the parent's own chair under
+  // a question shaped like a narrower one.
+  const parentOnlyNote =
+    winner.kind === 'committee' && winner.tier === 'all_words'
+      ? `"${nameArg}" matched only the parent committee "${winner.committee.name}" — no subcommittee name matched it as well or better. ` +
+        'See this response\'s `subcommittees` list for the valid subcommittee names/ids under this committee.'
+      : null;
+
   return {
-    data_as_of: CONGRESS_DATA_AS_OF,
-    ambiguous: true,
-    note: `"${nameArg}" matched ${matches.length} committees (one per chamber, usually) — pass chamber: "house" or "senate" to pick one.`,
-    matches: matches.map(buildFullCommittee),
+    ...record,
+    ...(parentOnlyNote ? { parent_only_match: true, note: parentOnlyNote } : {}),
+    ...(rest.length > 0
+      ? {
+          alternatives: rest.slice(0, 8).map(candidateSummary),
+          alternatives_note:
+            `${rest.length} other committee(s)/subcommittee(s) also matched every word of "${nameArg}" but less exactly than the result above — ` +
+            'listed in case this was not the one you meant; call again with committee_id to get one of these instead.',
+        }
+      : {}),
   };
 }
 
@@ -1200,13 +1363,20 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'get_votes',
     description:
-      'NOT AVAILABLE. GovTrack, the only source this tool ever used, now answers every endpoint with a Cloudflare bot-challenge (HTTP 403), and congress.gov\'s official API has no roll-call-vote endpoint covering both the House and the Senate (only a House-only one) — so there is no complete official replacement yet. Calling this returns an explanatory error immediately; it is a known gap, not a transient fault.',
+      'ANSWERS "how did the Senate vote on X" / "recent House roll calls" / "cloture vote tally" — recent roll-call votes for ONE chamber, newest first within that chamber + session. House votes come from the Clerk of the House\'s own records (via congress.gov\'s official API); Senate votes come from the Secretary of the Senate\'s own published roll-call vote records (public, no credentials). Pass chamber: "house" or "senate" — the two chambers number their votes independently, so there is no combined listing. Returns question, result, yes/no tallies and date for each vote; every response names its own chamber, congress, session and source. Pass congress + session to look at a specific past session (session can only be left out for the CURRENT Congress); omit both for the current session. A chamber/congress/session nothing has been published for returns a named reason, never a silent empty list.',
     inputSchema: {
       type: 'object',
       properties: {
-        limit: { type: 'number', description: 'Unused — this tool is not available.' },
-        congress: { type: 'number', description: 'Unused — this tool is not available.' },
+        chamber: { type: 'string', description: 'Required: "house" or "senate".' },
+        congress: { type: 'number', description: 'Congress number, e.g. 119. Omit for the current Congress.' },
+        session: {
+          type: 'number',
+          description:
+            '1 or 2 — each Congress has exactly two sessions, one per calendar year. Can be omitted only when congress is also omitted, or is the current Congress (it is then inferred from today\'s date).',
+        },
+        limit: { type: 'number', description: 'Number of votes to return (default 20, max 100).' },
       },
+      required: ['chamber'],
     },
   },
   {
@@ -1239,7 +1409,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'committee_members',
     description:
-      'ANSWERS "who is on the House Appropriations committee" / "roster of the Senate Judiciary committee" / "Democratic members of Ways and Means" — returns one committee\'s full membership with each member\'s party, rank and title (Chair / Ranking Member / plain member), plus the committee\'s chair, ranking member and list of subcommittees. Identify the committee by committee_id (the exact id from committee_leadership, e.g. "HSWM" for House Ways and Means, or a subcommittee id like "HSWM05") OR by name (e.g. "Appropriations", "Ways and Means", "Judiciary") — a name with no chamber that matches committees in BOTH the House and Senate (e.g. "Appropriations") returns both as `matches` rather than guessing; pass chamber to pick one directly. For the chair/ranking member of EVERY committee at once, use committee_leadership instead — it is cheaper when you do not need the full roster. SOURCE: github.com/unitedstates/congress-legislators (public domain), baked periodically, current (119th) Congress only.',
+      'ANSWERS "who is on the House Appropriations committee" / "roster of the Senate Judiciary committee" / "Democratic members of Ways and Means" / "chair of the Armed Services Subcommittee on Cybersecurity" — returns one committee OR SUBCOMMITTEE\'s full membership with each member\'s party, rank and title (Chair / Ranking Member / plain member), plus its own chair and ranking member. Identify it by committee_id (the exact id from committee_leadership, e.g. "HSWM" for House Ways and Means, or a subcommittee id like "SSAS21") OR by name — name matching searches SUBCOMMITTEE names too (bare, e.g. "Cybersecurity", or combined with the parent committee, e.g. "Senate Armed Services Subcommittee on Cybersecurity"), ranked exact-name-first; a looser match is disclosed as `alternatives` rather than silently dropped. A name matching only the parent committee (no subcommittee) is returned as the committee with `parent_only_match: true` and a note — never as if it were the more specific thing you asked for. A name with no chamber that matches equally well in BOTH the House and Senate (e.g. bare "Appropriations") returns both as `matches` rather than guessing; pass chamber to pick one directly. A subcommittee response names its parent separately (`parent_committee_id`/`parent_committee_name`) — its `chair`/`ranking_member` are its OWN, never the parent\'s. For the chair/ranking member of EVERY (top-level) committee at once, use committee_leadership instead — it is cheaper when you do not need the full roster, but does not search subcommittees. SOURCE: github.com/unitedstates/congress-legislators (public domain), baked periodically, current (119th) Congress only.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1276,7 +1446,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     case 'get_members':
       return getMembers(args);
     case 'get_votes':
-      return getVotes();
+      return getVotes(args);
     case 'get_recent_bills':
       return getRecentBills(args);
     case 'committee_leadership':
@@ -1595,25 +1765,317 @@ async function getMembers(args: Record<string, unknown>) {
   };
 }
 
+// --- get_votes: House (congress.gov) + Senate (senate.gov, keyless) ---
+// (fleet #3183 — follow-up to #3164, which left get_votes refusing outright
+// because congress.gov's roll-call-vote endpoint is House-only.)
+
+const HOUSE_VOTE_SOURCE = 'Clerk of the House of Representatives, roll call vote records (via congress.gov)';
+const SENATE_VOTE_SOURCE = 'Secretary of the Senate, roll call vote records';
+
 /**
- * NOT MIGRATED (fleet #3164): GovTrack's /vote endpoint is Cloudflare-blocked
- * like every other endpoint on that host, but congress.gov's official API has
- * no roll-call-vote endpoint that covers BOTH chambers — only a House-only
- * one (HouseRollCallVoteEndpoint). Returning House votes alone under a tool
- * named `get_votes` would silently drop every Senate vote behind a clean
- * 200 — a worse failure than today's loud one, and the shape
- * docs/silent-zero-policy.md exists to rule out. Fails immediately with no
- * network call (GovTrack is reliably dead; there is nothing to gain by
- * actually hitting it) so this is fast and honest rather than a guaranteed
- * timeout-shaped 403. Left as a known gap for a follow-up task.
+ * The Congress sitting on `now`. A Congress convenes on Jan 3 of every odd
+ * year. (Reintroduces the helper #3164 removed along with the rest of the
+ * old GovTrack-era search_bills — needed again here for "default to the
+ * current session" when no congress/session is named.)
  */
-function getVotes(): never {
-  throw new Error(
-    'congress get_votes: not available. GovTrack (the only source this tool ever used) now answers every ' +
-      'endpoint with a Cloudflare bot-challenge (HTTP 403), and congress.gov\'s official API has no roll-call-vote ' +
-      'endpoint covering both the House and the Senate (only a House-only one), so there is no complete official ' +
-      'replacement yet. This is a known gap, not a transient fault — retrying will not help.',
+function currentCongressNumber(now: Date): number {
+  const year = now.getUTCFullYear();
+  const oddYear = year % 2 === 1 ? year : year - 1;
+  let congress = (oddYear - 1789) / 2 + 1;
+  if (year % 2 === 1 && now < new Date(Date.UTC(year, 0, 3))) congress -= 1;
+  return congress;
+}
+
+/** Session 1 = a Congress's first calendar year, session 2 = its second — fixed by calendar year, not by actual adjournment. */
+function currentSessionNumber(now: Date, congress: number): 1 | 2 {
+  const firstYear = 1789 + (congress - 1) * 2;
+  return now.getUTCFullYear() === firstYear ? 1 : 2;
+}
+
+/**
+ * congress/session can only be safely DEFAULTED for the current Congress —
+ * for any other one, guessing which of its two sessions "now" implies would
+ * be wrong (today's date has no relationship to a past Congress's own
+ * calendar). So a named past/future congress without a session is a named
+ * argument error, not a guess.
+ */
+function resolveCongressSession(
+  congressArg: number | undefined,
+  sessionArg: 1 | 2 | undefined,
+): { congress: number; session: 1 | 2 } | { error: string } {
+  const now = new Date();
+  const nowCongress = currentCongressNumber(now);
+  if (congressArg == null) {
+    return { congress: nowCongress, session: sessionArg ?? currentSessionNumber(now, nowCongress) };
+  }
+  if (sessionArg != null) return { congress: congressArg, session: sessionArg };
+  if (congressArg === nowCongress) return { congress: congressArg, session: currentSessionNumber(now, congressArg) };
+  return {
+    error: `Pass session (1 or 2) along with congress ${congressArg} — it can only be inferred for the current Congress (${nowCongress}).`,
+  };
+}
+
+const VALID_VOTE_CHAMBERS = new Set(['house', 'senate']);
+
+async function getVotes(args: Record<string, unknown>) {
+  const chamber = typeof args.chamber === 'string' ? args.chamber.trim().toLowerCase() : '';
+  if (!VALID_VOTE_CHAMBERS.has(chamber)) {
+    return {
+      error:
+        'Pass chamber: "house" or "senate" — the House and Senate number their roll-call votes independently, ' +
+        'so there is no single combined listing for "Congress".',
+    };
+  }
+  const congressArg = typeof args.congress === 'number' ? Math.floor(args.congress) : undefined;
+  const sessionArgRaw = typeof args.session === 'number' ? Math.floor(args.session) : undefined;
+  if (sessionArgRaw != null && sessionArgRaw !== 1 && sessionArgRaw !== 2) {
+    return { error: `session must be 1 or 2 (each Congress has exactly two sessions, one per calendar year) — got ${sessionArgRaw}.` };
+  }
+  const resolved = resolveCongressSession(congressArg, sessionArgRaw as 1 | 2 | undefined);
+  if ('error' in resolved) return resolved;
+  const { congress, session } = resolved;
+  const limit = typeof args.limit === 'number' ? args.limit : 20;
+  const count = Math.min(Math.max(1, limit), 100);
+
+  return chamber === 'house' ? getHouseVotes(args, congress, session, count) : getSenateVotes(congress, session, count);
+}
+
+type RawHouseVote = {
+  congress?: number | null;
+  sessionNumber?: number | null;
+  rollCallNumber?: number | null;
+  startDate?: string | null;
+  result?: string | null;
+  voteType?: string | null;
+  legislationType?: string | null;
+  legislationNumber?: string | null;
+  legislationUrl?: string | null;
+  voteQuestion?: string | null;
+  votePartyTotal?: Array<{
+    yeaTotal?: number | null;
+    nayTotal?: number | null;
+    presentTotal?: number | null;
+    notVotingTotal?: number | null;
+  }> | null;
+};
+
+function sumHouseVoteTotals(parties: RawHouseVote['votePartyTotal']): { yea: number; nay: number; present: number; notVoting: number } {
+  const totals = { yea: 0, nay: 0, present: 0, notVoting: 0 };
+  for (const p of parties ?? []) {
+    totals.yea += p.yeaTotal ?? 0;
+    totals.nay += p.nayTotal ?? 0;
+    totals.present += p.presentTotal ?? 0;
+    totals.notVoting += p.notVotingTotal ?? 0;
+  }
+  return totals;
+}
+
+function formatHouseVote(v: RawHouseVote): Record<string, unknown> {
+  const totals = v.votePartyTotal ? sumHouseVoteTotals(v.votePartyTotal) : null;
+  return {
+    chamber: 'house',
+    congress: v.congress ?? null,
+    session: v.sessionNumber ?? null,
+    number: v.rollCallNumber ?? null,
+    date: v.startDate ?? null,
+    question: v.voteQuestion ?? null,
+    vote_type: v.voteType ?? null,
+    result: v.result ?? null,
+    yes_votes: totals?.yea ?? null,
+    no_votes: totals?.nay ?? null,
+    present_votes: totals?.present ?? null,
+    not_voting: totals?.notVoting ?? null,
+    other_votes: totals ? totals.present + totals.notVoting : null,
+    related_bill: v.legislationType && v.legislationNumber ? `${v.legislationType} ${v.legislationNumber}` : null,
+    link: v.legislationUrl ?? null,
+  };
+}
+
+/**
+ * congress.gov's house-vote LIST endpoint (verified live, 2026-10-16) carries
+ * no `question` or vote totals — only the DETAIL endpoint
+ * (/house-vote/{congress}/{session}/{number}) does, so each returned vote
+ * needs its own follow-up fetch (same N+1 shape already used by
+ * search_bills). The list also has no documented sort parameter (checked
+ * against the API's own OpenAPI spec) and was NOT observed coming back
+ * date-ordered live, so results are re-sorted locally by `startDate` before
+ * taking the top `count` — the same defensive re-ranking this pack already
+ * does for search_bills/GovInfo.
+ *
+ * NOTE: the detail endpoint's exact wrapper key (`houseRollCallVote`,
+ * singular) follows this API's consistent list/detail naming convention
+ * (bills: "bills"/"bill"; members: "members"/"member") but was NOT
+ * independently live-verified for this specific endpoint — DEMO_KEY's 10/hr
+ * quota was exhausted before it could be checked. `formatHouseVote` is
+ * called with a fallback to the raw object if that key is absent, so a wrong
+ * guess degrades to missing question/totals rather than throwing.
+ */
+async function getHouseVotes(args: Record<string, unknown>, congress: number, session: number, count: number) {
+  const apiKey = requireApiKey(args);
+  const fetchLimit = Math.min(250, Math.max(count * 3, 50));
+  const list = await congressGovFetch<{ houseRollCallVotes?: RawHouseVote[] }>(
+    `/house-vote/${congress}/${session}`,
+    { limit: fetchLimit },
+    apiKey,
   );
+  const raw = list.houseRollCallVotes ?? [];
+  if (raw.length === 0) {
+    return {
+      found: false,
+      chamber: 'house',
+      source: HOUSE_VOTE_SOURCE,
+      error:
+        `No House roll-call votes found for congress ${congress}, session ${session} on congress.gov. ` +
+        'That session may not have started yet, may genuinely have recorded none so far, or may be outside this source\'s coverage.',
+      congress,
+      session,
+    };
+  }
+  const top = [...raw].sort((a, b) => (b.startDate ?? '').localeCompare(a.startDate ?? '')).slice(0, count);
+  const detailed = await Promise.all(
+    top.map(async (v) => {
+      try {
+        const detail = await congressGovFetch<Record<string, unknown>>(
+          `/house-vote/${v.congress}/${v.sessionNumber}/${v.rollCallNumber}`,
+          {},
+          apiKey,
+        );
+        const inner = (detail.houseRollCallVote as RawHouseVote | undefined) ?? (detail as RawHouseVote);
+        return formatHouseVote(inner);
+      } catch {
+        // The per-vote detail fetch failed (rare — e.g. a transient 5xx) —
+        // still report the vote from the list row rather than dropping it
+        // silently; it will be missing question/totals, which is visibly
+        // different from a vote that never existed.
+        return { ...formatHouseVote(v), detail_fetch_failed: true };
+      }
+    }),
+  );
+  return {
+    chamber: 'house',
+    source: HOUSE_VOTE_SOURCE,
+    congress,
+    session,
+    total: raw.length,
+    returned: detailed.length,
+    votes: detailed,
+  };
+}
+
+const SENATE_MONTHS: Record<string, string> = {
+  Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06',
+  Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12',
+};
+
+/** "18-Dec" + the menu's own `<congress_year>` -> "2025-12-18". Falls back to the raw string if either doesn't parse — never throws on an odd date. */
+function formatSenateVoteDate(dateStr: string | null, congressYear: string | null): string | null {
+  if (!dateStr || !congressYear) return dateStr;
+  const m = /^(\d{1,2})-([A-Za-z]{3})$/.exec(dateStr);
+  const mm = m ? SENATE_MONTHS[m[2]] : undefined;
+  if (!m || !mm) return dateStr;
+  return `${congressYear}-${mm}-${m[1].padStart(2, '0')}`;
+}
+
+function numOrNull(s: string | null): number | null {
+  if (s == null) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * One <vote> block from the Senate's vote-menu XML. Most votes carry a flat
+ * <issue>/<question>; an "en bloc" vote (several nominations confirmed
+ * together) nests them under <en_bloc><matter> instead and has no top-level
+ * <issue>/<question> — handled by falling back to a count of <matter>
+ * elements rather than leaving `question` null (verified live: vote 655,
+ * 119th Congress 1st session, "En Bloc Nominations... S. Res. 532").
+ */
+function formatSenateVoteRow(block: string, congress: number, session: number, congressYear: string | null): Record<string, unknown> {
+  const enBlocMatters = xmlBlocks(block, 'matter');
+  // An en-bloc vote's own <matter> children each carry a <question>/<issue>
+  // too (e.g. "On the Nomination" repeated per nominee) — strip the whole
+  // <en_bloc>...</en_bloc> span before looking for a TOP-LEVEL <question>/
+  // <issue>, or a non-global xmlTag() on the raw block finds the FIRST
+  // matter's question and silently reports it as if it were the vote's own
+  // (caught by a test fixture built from the real en-bloc XML, vote 655).
+  const topLevel = block.replace(/<en_bloc>[\s\S]*?<\/en_bloc>/i, '');
+  const question = xmlTag(topLevel, 'question') ?? (enBlocMatters.length > 0 ? `En bloc confirmation of ${enBlocMatters.length} matters` : null);
+  const tallyBlock = xmlTag(block, 'vote_tally') ?? '';
+  return {
+    chamber: 'senate',
+    congress,
+    session,
+    number: xmlTag(block, 'vote_number'),
+    date: formatSenateVoteDate(xmlTag(block, 'vote_date'), congressYear),
+    question,
+    issue: xmlTag(topLevel, 'issue'),
+    // Not falling back to a nested <matter>'s own <result> here (unlike
+    // `question`'s count-based fallback above) — an en-bloc vote's matters
+    // could in principle have mixed individual results, so null is more
+    // honest than attributing one matter's outcome to the whole vote.
+    result: xmlTag(topLevel, 'result'),
+    yes_votes: numOrNull(xmlTag(tallyBlock, 'yeas')),
+    no_votes: numOrNull(xmlTag(tallyBlock, 'nays')),
+    title: xmlTag(block, 'title'),
+    en_bloc_matter_count: enBlocMatters.length > 0 ? enBlocMatters.length : null,
+  };
+}
+
+/**
+ * Senate.gov publishes one XML "menu" per Congress+session listing every
+ * roll-call vote that session (newest first — verified live, 2026-10-16: the
+ * 119th Congress 2nd session menu opens with vote 256, 30-Sep-2026, and
+ * counts down). Public, no credentials, no rate limit observed. Per-vote
+ * detail XML (with the full member-by-member breakdown) also exists at
+ * roll_call_votes/vote{congress}{session}/vote_{congress}_{session}_{number}.xml
+ * but is not fetched here — the menu already carries yea/nay totals,
+ * question and result, which is everything get_votes's House side also
+ * returns; a per-member breakdown is a different, heavier question than
+ * "how did the vote go."
+ */
+async function getSenateVotes(congress: number, session: number, count: number) {
+  const url = `${SENATE_VOTE_MENU_BASE}/vote_menu_${congress}_${session}.xml`;
+  const res = await pwFetch(url);
+  if (res.status === 404) {
+    return {
+      found: false,
+      chamber: 'senate',
+      error: `senate.gov has no roll-call vote menu for congress ${congress}, session ${session} — that session may not exist or may not have started yet.`,
+      congress,
+      session,
+    };
+  }
+  if (!res.ok) throw await httpError(res, 'Senate roll-call vote menu error');
+  const xml = await res.text();
+  if (!xml.includes('<vote_summary')) {
+    throw new Error(
+      `senate.gov answered congress ${congress} session ${session}'s vote menu with something other than the expected XML — senate.gov may be degraded. Retrying later is reasonable.`,
+    );
+  }
+  const congressYear = xmlTag(xml, 'congress_year');
+  const rows = xmlBlocks(xml, 'vote');
+  if (rows.length === 0) {
+    return {
+      found: false,
+      chamber: 'senate',
+      source: SENATE_VOTE_SOURCE,
+      error:
+        `senate.gov's vote menu for congress ${congress}, session ${session} lists zero roll-call votes — ` +
+        'that session may not have started yet, or genuinely recorded none so far.',
+      congress,
+      session,
+    };
+  }
+  const top = rows.slice(0, count);
+  return {
+    chamber: 'senate',
+    source: SENATE_VOTE_SOURCE,
+    congress,
+    session,
+    total: rows.length,
+    returned: top.length,
+    votes: top.map((b) => formatSenateVoteRow(b, congress, session, congressYear)),
+  };
 }
 
 type RawLaw = {

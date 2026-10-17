@@ -21,7 +21,7 @@ Common flows:
 
 ## 2026-10-16: moved off GovTrack
 
-This pack used to call GovTrack's public API. GovTrack now answers every endpoint it has — bills, members, votes — with a Cloudflare bot-challenge page served as HTTP 403, so every tool that relied on it failed on every call. `search_bills`, `get_bill`, `get_recent_bills` and `get_members` now call the official sources instead (congress.gov, plus GovInfo for `search_bills`'s keyword search — see below). `get_votes` has no complete official replacement yet (see "Known gap" below) and now refuses immediately rather than making a doomed call.
+This pack used to call GovTrack's public API. GovTrack now answers every endpoint it has — bills, members, votes — with a Cloudflare bot-challenge page served as HTTP 403, so every tool that relied on it failed on every call. `search_bills`, `get_bill`, `get_recent_bills` and `get_members` now call the official sources instead (congress.gov, plus GovInfo for `search_bills`'s keyword search — see below). `get_votes` now serves the House from congress.gov and the Senate from senate.gov's own records (see "Roll-call votes" below) — it briefly refused outright between #3164 and #3183 because congress.gov's roll-call endpoint is House-only.
 
 ## Search ranking (`search_bills`)
 
@@ -37,9 +37,22 @@ congress.gov's own bill listing has no free-text search parameter at all — it 
 
 GovTrack never had an endpoint for enacted laws. congress.gov does: pass a Congress number (and optionally `law_type: "priv"` for private laws) to get the count, the most recent law, and the list — newest first.
 
-## Known gap: `get_votes` is not available
+## Committees and subcommittees (`committee_leadership`, `committee_members`)
 
-congress.gov's official API has a roll-call-vote endpoint for the House only — there is no official source covering Senate votes alongside it. Rather than silently return House-only results under a tool that implies both chambers, `get_votes` refuses immediately with an explanatory error. This is a known, tracked gap (fleet #3164), not a transient fault.
+Baked from a SEPARATE public-domain source (github.com/unitedstates/congress-legislators) — neither congress.gov nor GovTrack has a committee-membership or committee-leadership endpoint at all. `data_as_of` on every response is that source's own last-update date.
+
+`committee_members` identifies a committee OR a subcommittee by `committee_id` (exact) or by `name`. Name search (fleet #3203, 2026-10-16) looks at SUBCOMMITTEE names too, not just the ~230 top-level committees — "Cybersecurity" alone finds the Senate Armed Services Subcommittee on Cybersecurity (SSAS21) directly, and so does the fuller "Senate Armed Services Subcommittee on Cybersecurity" (disambiguating it from House Armed Services' own Cyber-named subcommittee). Matching is word-token (every query word must appear in, or be a prefix/suffix of, a candidate word) and exact-first ranked: an unambiguous exact name match wins outright even when several looser matches exist, and those are disclosed as `alternatives` rather than silently dropped. A name that matches only the PARENT committee (no subcommittee) is returned as the committee, with `parent_only_match: true` and a note — never presented as if it were a more specific subcommittee. A subcommittee's own record always names its parent separately (`parent_committee_id`/`parent_committee_name`); its `chair`/`ranking_member` are its OWN, resolved from its own roster, never the parent's.
+
+## Roll-call votes (`get_votes`) — two sources, one tool
+
+(fleet #3183, 2026-10-16 — follow-up to #3164, which left this tool refusing outright.) Pass `chamber: "house"` or `"senate"`; the two chambers number their roll-call votes independently, so there is no single combined listing.
+
+- **House** — the Clerk of the House's own roll-call vote records, via congress.gov's official API. Requires the same API key as the rest of this pack.
+- **Senate** — the Secretary of the Senate's own published roll-call vote records (senate.gov), public and keyless. Dates in the source are day-month only ("18-Dec"); this pack reconstructs the year from the source's own per-session header.
+
+Every response names its own `chamber`, `congress`, `session` and `source`. Omit `congress`/`session` for the CURRENT session; `session` (1 or 2 — each Congress has exactly two, one per calendar year) can only be inferred for the current Congress — naming a different, past Congress without a session is a named argument error, not a guess. A chamber/congress/session nothing has been published for returns a named reason, never a silent empty list.
+
+An "en bloc" Senate vote (several nominees confirmed together, e.g. under a standing order) has no single `question`/`issue` of its own — `question` becomes "En bloc confirmation of N matters" and `en_bloc_matter_count` carries the count, rather than silently reporting one nominee's own question as if it were the whole vote's.
 
 ## Congress numbering
 
@@ -64,7 +77,7 @@ For "regular legislation" purposes, HR and S are the meaningful types. Resolutio
 
 - **Bill status nuance.** "Introduced" is the start. "Reported" by committee is meaningful progress. "Engrossed" / "passed chamber" matters. "Enrolled" / "presented to president" is near-final. Most bills die quietly in committee; "introduced" alone is weak signal. `status_label` on each bill is congress.gov's free-text `latestAction`, not a coded status — read it rather than pattern-matching it.
 - **Companion bills.** Identical legislation often introduced in both chambers as paired bills (HR 1234 + S 567). Both must pass.
-- **Roll-call votes only (and currently unavailable here — see "Known gap" above).** Many congressional decisions happen by voice vote or unanimous consent and never appear in roll-call records even when this tool returns.
+- **Roll-call votes only.** `get_votes` covers recorded roll calls — many congressional decisions happen by voice vote or unanimous consent and never appear in either chamber's roll-call records at all.
 - **Committee referrals.** A bill can be referred to multiple committees (sequential, joint, or split). It must clear all to advance. The committee structure matters more than the introduction.
 - **Cosponsorship is cheap.** Members cosponsor freely. A 100-cosponsor bill is meaningful; a 5-cosponsor bill in a 435-member House isn't necessarily.
 
@@ -119,12 +132,12 @@ reaches all of them from either one.
 ## No MCP client? Call it over HTTP
 
 ```bash
-curl -X POST https://gateway.pipeworx.io/v1/tools/congress_search_bills \
+curl -X POST https://gateway.pipeworx.io/v1/tools/search_bills \
   -H 'Content-Type: application/json' \
   -d '{"query":"Lower Energy Costs Act","limit":10}'
 ```
 
-No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/congress_search_bills`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
+No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/search_bills`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
 
 ## Standalone (no gateway account)
 
