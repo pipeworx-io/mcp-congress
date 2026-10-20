@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-congress",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Congress MCP — US Congress bill/law/member data via the official congress.gov API (Library of Congress, api.data.gov-fronted) plus committee rosters/leadership baked from a second, public-domain source.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-f4246479820a83a3c06d48c9fa5dd0c9d66ae2f8daca6cd71f17b8f913e8bfec",
-    "sourceCommit": "5536c83e6ec7e258ecb15c88ee96db42c5fdf9a3"
+    "sourceHash": "v1-bdaa54a69a1e8d6865aebd4a00dfba6b0d75292ba400579f57f7274e598480b8",
+    "sourceCommit": "b0a4b8e2f3f5b3a4c3f9f2c9a73f91b20d32ce11"
   }
 }

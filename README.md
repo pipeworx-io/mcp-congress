@@ -2,7 +2,7 @@
 
 US federal bills (House and Senate), enacted public/private laws, and members of Congress, served from the Library of Congress's official congress.gov API, plus a full-text keyword search over the GPO's GovInfo index of the same bill documents. Bill status, sponsors, enacted laws, member rosters. Requires a free api.data.gov key.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1819+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1854+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Why this matters for AI agents
 
@@ -129,7 +129,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1819+ data sources. The
+Both URLs reach the same gateway and the same 1854+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
