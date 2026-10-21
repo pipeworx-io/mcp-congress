@@ -2,7 +2,7 @@
 
 US federal bills (House and Senate), enacted public/private laws, and members of Congress, served from the Library of Congress's official congress.gov API, plus a full-text keyword search over the GPO's GovInfo index of the same bill documents. Bill status, sponsors, enacted laws, member rosters. Requires a free api.data.gov key.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1854+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1855+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Why this matters for AI agents
 
@@ -57,6 +57,16 @@ An "en bloc" Senate vote (several nominees confirmed together, e.g. under a stan
 `total` (House) is congress.gov's own session vote count (`pagination.count`), the same at any `limit` — the House list endpoint carries no sort and this pack fetches/re-ranks only enough rows to satisfy `limit`, so `total` is read from the API's own count, never backfilled from however many rows this one call happened to fetch (fleet #3215). If congress.gov ever omits that count, `total` is left out entirely with a `note`, rather than silently reporting the fetched-row count as the real total. `other_votes` was dropped from House vote records (fleet #3215) — it was a sum of `present_votes` + `not_voting` that, on every observed live vote, read identically to `not_voting` alone (present votes are rare); sum the two yourself if you want that figure.
 
 House votes are NOT read from the list endpoint at all, at any offset — confirmed live, 2026-10-17: even a page fetched from the TAIL of the list (an earlier attempt at this fix) can have holes (one real session's `limit:10` came back `314..307, 304, 303` — rolls 306 and 305 were simply missing from that page). House roll-call numbers are sequential 1..`pagination.count` within a session, so the newest votes are addressed DIRECTLY by number (`count`, `count-1`, ...) via the single-vote detail endpoint — no list page, no jitter, no holes. This is capped at **25 per call** for House (each vote costs its own upstream request); a higher `limit` is clamped with a note. A roll number congress.gov has no record of (vacated/stricken and never reused) is skipped and named in `note` — `total` itself is unaffected, since it already comes from `pagination.count`, not from counting what was successfully fetched.
+
+## Member statistics (`member_legislative_stats`)
+
+`member_legislative_stats({ bioguide_id, congress? })` returns, for one member in one Congress:
+bills sponsored, bills cosponsored, sponsored bills that became law, and the share of the
+member's newest sponsored bills (up to 60, reported as `bills_analysed`) that drew at least one
+cosponsor from the other major party. These are counts Pipeworx computes from Library of Congress
+records, not an official score. GovTrack's report-card figures (bills *joined* from the other party,
+rank and percentile among members) are not computed: they need every member's record, and GovTrack
+blocks automated access. The response says so in `not_computed`.
 
 ## Congress numbering
 
@@ -129,7 +139,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1854+ data sources. The
+Both URLs reach the same gateway and the same 1855+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

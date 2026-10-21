@@ -11,7 +11,7 @@ import * as bakedIndexModule from './committee-index-data.js';
 const bakedIndex = Object.fromEntries(Object.entries(bakedIndexModule));
 
 const server = new Server(
-  { name: '@pipeworx/mcp-congress', version: '0.1.8' },
+  { name: '@pipeworx/mcp-congress', version: '0.1.9' },
   { capabilities: { tools: {} } },
 );
 

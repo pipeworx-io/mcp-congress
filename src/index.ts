@@ -1679,7 +1679,123 @@ const tools: McpToolExport['tools'] = [
       required: ['bioguide_id'],
     },
   },
+  {
+    name: 'member_legislative_stats',
+    description:
+      'ANSWERS "how many bills has Rep. X sponsored", "how bipartisan is Senator Y", "what share of X\'s bills have other-party cosponsors" — legislative activity statistics for ONE member of Congress in one Congress, computed from congress.gov records: bills sponsored, bills cosponsored, sponsored bills that became law, and how many of the member\'s sponsored bills drew at least one cosponsor from the other major party (checked on the newest bills_analysed of them). These are our own computed counts, not an official score, and not GovTrack\'s ranked report-card metrics (no percentile/rank is computed). Requires an API key (see get_bill).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        bioguide_id: { type: 'string', description: 'The member\'s bioguide id, e.g. "R000603" (get_members returns them).' },
+        congress: { type: 'number', description: 'Congress number, e.g. 118 for 2023-2024 (default: the current Congress).' },
+      },
+      required: ['bioguide_id'],
+    },
+  },
 ];
+
+// --- member_legislative_stats: computed from congress.gov member + bill records ---
+
+const STATS_SOURCE = 'Library of Congress, congress.gov member and bill records';
+const STATS_MAX_BILLS_ANALYSED = 60;
+
+type RawSponsoredItem = { congress?: number; type?: string; number?: string; latestAction?: { text?: string | null } | null };
+type RawCosponsorsResp = { cosponsors?: { party?: string | null }[]; pagination?: { count?: number } };
+
+function partyLetter(name: string | null | undefined): string | null {
+  const n = (name ?? '').toLowerCase();
+  if (n.startsWith('republican') || n === 'r') return 'R';
+  if (n.startsWith('democrat') || n === 'd') return 'D';
+  if (n.startsWith('independent') || n === 'i' || n === 'id') return 'I';
+  return null;
+}
+
+async function pageAll<T>(path: string, key: string, apiKey: string, maxPages = 8): Promise<{ items: T[]; total: number; truncated: boolean }> {
+  const items: T[] = [];
+  let total = 0;
+  for (let p = 0; p < maxPages; p++) {
+    const data = await congressGovFetch<Record<string, unknown> & { pagination?: { count?: number } }>(
+      path,
+      { limit: 250, offset: p * 250 },
+      apiKey,
+    );
+    total = data.pagination?.count ?? total;
+    const page = (data[key] as T[] | undefined) ?? [];
+    items.push(...page);
+    if (!page.length || items.length >= total) return { items, total, truncated: false };
+  }
+  return { items, total, truncated: items.length < total };
+}
+
+async function memberLegislativeStats(args: Record<string, unknown>) {
+  const apiKey = requireApiKey(args);
+  const id = typeof args.bioguide_id === 'string' ? args.bioguide_id.trim().toUpperCase() : '';
+  if (!/^[A-Z]\d{6}$/.test(id)) throw new Error('bioguide_id is required, e.g. "R000603" (get_members returns them)');
+  const congress = typeof args.congress === 'number' && args.congress > 0 ? Math.floor(args.congress) : currentCongressNumber(new Date());
+
+  const [prof, sponsored, cosponsored] = await Promise.all([
+    congressGovFetch<{ member?: { directOrderName?: string; invertedOrderName?: string; partyHistory?: { partyName?: string; startYear?: number }[]; terms?: unknown } }>(`/member/${id}`, {}, apiKey),
+    pageAll<RawSponsoredItem>(`/member/${id}/sponsored-legislation`, 'sponsoredLegislation', apiKey),
+    pageAll<RawSponsoredItem>(`/member/${id}/cosponsored-legislation`, 'cosponsoredLegislation', apiKey),
+  ]);
+  const m = prof.member;
+  if (!m) throw new Error(`congress.gov has no member ${id}`);
+  const hist = m.partyHistory ?? [];
+  const party = partyLetter(hist.length ? hist[hist.length - 1].partyName : null);
+
+  const mySponsored = sponsored.items.filter((b) => b.congress === congress);
+  const myCosponsored = cosponsored.items.filter((b) => b.congress === congress);
+  const becameLaw = mySponsored.filter((b) => /became (public|private) law/i.test(b.latestAction?.text ?? '')).length;
+
+  const sample = mySponsored.filter((b) => b.type && b.number).slice(0, STATS_MAX_BILLS_ANALYSED);
+  let withOther = 0;
+  let withAnyCosponsor = 0;
+  let failed = 0;
+  const queue = [...sample];
+  const worker = async () => {
+    for (let b = queue.shift(); b; b = queue.shift()) {
+      try {
+        const r = await congressGovFetch<RawCosponsorsResp>(`/bill/${congress}/${b.type!.toLowerCase()}/${b.number}/cosponsors`, { limit: 250 }, apiKey);
+        const cs = r.cosponsors ?? [];
+        if (cs.length) withAnyCosponsor++;
+        if (party === 'R' || party === 'D') {
+          const other = party === 'R' ? 'D' : 'R';
+          if (cs.some((c) => partyLetter(c.party) === other)) withOther++;
+        }
+      } catch {
+        failed++;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: 6 }, worker));
+  const analysed = sample.length - failed;
+  const classifiable = party === 'R' || party === 'D';
+
+  return {
+    bioguide_id: id,
+    name: m.directOrderName ?? m.invertedOrderName ?? null,
+    party,
+    congress,
+    bills_sponsored: mySponsored.length,
+    bills_cosponsored: myCosponsored.length,
+    sponsored_became_law: becameLaw,
+    bipartisan_sponsorship: {
+      bills_analysed: analysed,
+      of_sponsored_total: mySponsored.length,
+      with_any_cosponsor: withAnyCosponsor,
+      with_other_party_cosponsor: classifiable ? withOther : null,
+      share_with_other_party_cosponsor: classifiable && analysed ? Math.round((withOther / analysed) * 1000) / 1000 : null,
+      note: classifiable
+        ? 'Share of the newest bills_analysed sponsored bills with at least one cosponsor from the other major party (first 250 cosponsors per bill).'
+        : 'Member is not recorded as Republican or Democrat, so an other-party share is not computed.',
+    },
+    not_computed: 'Bills this member JOINED that were led by the other party, and rank/percentile among members, are not computed: they need every member\'s record and the sponsor of every cosponsored bill (GovTrack publishes those report-card figures but blocks automated access).',
+    truncated: sponsored.truncated || cosponsored.truncated,
+    source: STATS_SOURCE,
+    data_as_of: new Date().toISOString().slice(0, 10),
+    methodology: 'Counts of sponsored/cosponsored measures in the named Congress as congress.gov currently lists them; computed by Pipeworx, not an official score.',
+  };
+}
 
 // --- callTool dispatcher ---
 
@@ -1703,6 +1819,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return committeeMembers(args);
     case 'member_committees':
       return memberCommittees(args);
+    case 'member_legislative_stats':
+      return memberLegislativeStats(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
