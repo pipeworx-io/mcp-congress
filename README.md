@@ -2,7 +2,7 @@
 
 US federal bills (House and Senate), enacted public/private laws, and members of Congress, served from the Library of Congress's official congress.gov API, plus a full-text keyword search over the GPO's GovInfo index of the same bill documents. Bill status, sponsors, enacted laws, member rosters. Requires a free api.data.gov key.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1855+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1875+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Why this matters for AI agents
 
@@ -21,7 +21,7 @@ Common flows:
 
 ## 2026-10-16: moved off GovTrack
 
-This pack used to call GovTrack's public API. GovTrack now answers every endpoint it has — bills, members, votes — with a Cloudflare bot-challenge page served as HTTP 403, so every tool that relied on it failed on every call. `search_bills`, `get_bill`, `get_recent_bills` and `get_members` now call the official sources instead (congress.gov, plus GovInfo for `search_bills`'s keyword search — see below). `get_votes` now serves the House from congress.gov and the Senate from senate.gov's own records (see "Roll-call votes" below) — it briefly refused outright between #3164 and #3183 because congress.gov's roll-call endpoint is House-only.
+This pack used to call GovTrack's public API. GovTrack now answers every endpoint it has — bills, members, votes — with a Cloudflare bot-challenge page served as HTTP 403, so every tool that relied on it failed on every call. `search_bills`, `get_bill`, `get_recent_bills` and `get_members` now call the official sources instead (congress.gov, plus GovInfo for `search_bills`'s keyword search — see below). `get_votes` now serves the House from congress.gov and the Senate from the Congressional Record (see "Roll-call votes" below) — it briefly refused outright between #3164 and #3183 because congress.gov's roll-call endpoint is House-only.
 
 ## Search ranking (`search_bills`)
 
@@ -48,11 +48,14 @@ Baked from a SEPARATE public-domain source (github.com/unitedstates/congress-leg
 (fleet #3183, 2026-10-16 — follow-up to #3164, which left this tool refusing outright.) Pass `chamber: "house"` or `"senate"`; the two chambers number their roll-call votes independently, so there is no single combined listing.
 
 - **House** — the Clerk of the House's own roll-call vote records, via congress.gov's official API. Requires the same API key as the rest of this pack.
-- **Senate** — the Secretary of the Senate's own published roll-call vote records (senate.gov), public and keyless. Dates in the source are day-month only ("18-Dec"); this pack reconstructs the year from the source's own per-session header.
+- **Senate** — the Congressional Record, published by the U.S. Government Publishing Office (through GovInfo, with the same API key as the rest of this pack). The Record prints every Senate roll call with its tally and its Yeas / Nays / Present / Not Voting lists; this pack reads those. The Secretary of the Senate's own site refuses automated requests (HTTP 403 from a web-application firewall, root page included), and congress.gov has no Senate roll-call endpoint, so it is not read.
+  - `date` is the Record's issue date, i.e. the Senate's legislative day: a day that runs past midnight is printed under the earlier date (the 1 July 2025 vote on H.R. 1 is under 30 June).
+  - `question` and `result` are the Record's own sentences (`The question is, Will the Senate advise and consent...` / `The nomination was confirmed.`). When the Record has no outcome sentence this tool can match, `result` is `null` with a `result_note` — it is never inferred from the tally, because cloture and treaty votes need more than a simple majority.
+  - A roll-call block is returned only if its Yeas/Nays lists match the counts the Record announces, in two places. One that does not is listed under `unparsed` with the reason, and a gap in the returned range of vote numbers is named in `note`.
+  - `total` is the highest roll-call number printed so far in the session (Senate roll numbers run 1..N), not a count of what this call read.
+  - Per-senator positions, attendance and party-line share are `congress-member-votes` with `chamber: "senate"`.
 
 Every response names its own `chamber`, `congress`, `session` and `source`. Omit `congress`/`session` for the CURRENT session; `session` (1 or 2 — each Congress has exactly two, one per calendar year) can only be inferred for the current Congress — naming a different, past Congress without a session is a named argument error, not a guess. A chamber/congress/session nothing has been published for returns a named reason, never a silent empty list.
-
-An "en bloc" Senate vote (several nominees confirmed together, e.g. under a standing order) has no single `question`/`issue` of its own — `question` becomes "En bloc confirmation of N matters" and `en_bloc_matter_count` carries the count, rather than silently reporting one nominee's own question as if it were the whole vote's.
 
 `total` (House) is congress.gov's own session vote count (`pagination.count`), the same at any `limit` — the House list endpoint carries no sort and this pack fetches/re-ranks only enough rows to satisfy `limit`, so `total` is read from the API's own count, never backfilled from however many rows this one call happened to fetch (fleet #3215). If congress.gov ever omits that count, `total` is left out entirely with a `note`, rather than silently reporting the fetched-row count as the real total. `other_votes` was dropped from House vote records (fleet #3215) — it was a sum of `present_votes` + `not_voting` that, on every observed live vote, read identically to `not_voting` alone (present votes are rare); sum the two yourself if you want that figure.
 
@@ -139,7 +142,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1855+ data sources. The
+Both URLs reach the same gateway and the same 1875+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
