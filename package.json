@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-congress",
-  "version": "0.1.10",
+  "version": "0.2.0",
   "description": "Congress MCP — US Congress bill/law/member data via the official congress.gov API (Library of Congress, api.data.gov-fronted) plus committee rosters/leadership baked from a second, public-domain source.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-congress": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "congress"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-congress.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/congress",
   "pipeworx": {
-    "sourceHash": "v1-ec3adf907dd5cb1ee540057e22936d9c32047ef0a4083ea60a46e856fddd341b",
-    "sourceCommit": "f1ef7a2f6b9cb1b8da1374ec2fcb28c661582b35"
+    "mode": "gateway",
+    "slug": "congress",
+    "gatewaySlug": "congress",
+    "sourceHash": "v1-def5420c8d5cf52d6870dcb108a9fd72237fd196a53c8a0f626c67b4e619324d",
+    "sourceCommit": "4277282d72f9bf55e548b3799aaf737baf22152f"
   }
 }
